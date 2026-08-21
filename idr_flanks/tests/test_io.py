@@ -69,14 +69,28 @@ class TestReadPdb:
             for res in chain:
                 assert all(not a.is_hydrogen for a in res.atoms)
 
-    def test_element_column_offset_is_pinned(self, pdb):
-        """Elements must come from columns 77-78, not be guessed."""
-        res = pdb["A"].residue_by_seq_id(54)   # LEU54
-        assert res.atom("N").element == "N"
-        assert res.atom("CA").element == "C"
-        assert res.atom("O").element == "O"
-        met = next(r for r in pdb["A"] if r.resname == "MET")
-        assert met.atom("SD").element == "S"
+    def test_element_column_takes_precedence_over_the_name(self, tmp_path):
+        """Columns 77-78 must actually be read, and must win.
+
+        Pinned with a case where the two disagree: the atom-name field reads
+        " CA " (an alpha carbon) while columns 77-78 say CA (calcium). If the
+        column were ignored, the element would come out as carbon.
+        """
+        # Built by column position: the element field is columns 77-78, and a
+        # hand-aligned literal is one space out.
+        lines = [
+            "HETATM    1  CA  UNK X 999      0.000   0.000   0.000  1.00  0.00".ljust(76) + "CA",
+            "ATOM      2  CA  ALA A   1      5.000   0.000   0.000  1.00  0.00".ljust(76) + " C",
+            "END",
+        ]
+        path = tmp_path / "prec.pdb"
+        path.write_text("\n".join(lines) + "\n")
+        s = read_pdb(str(path))
+        # the amino acid's CA stays carbon
+        assert s["A"][0].atom("CA").element == "C"
+        # and the calcium HETATM was read as calcium, hence not an amino acid
+        assert s.skipped_residues.get("UNK") == 1
+        assert s.heteroatoms()[1] == ["Ca"]
 
     def test_no_duplicate_atom_names_within_residue(self, pdb):
         for chain in pdb:
@@ -252,6 +266,23 @@ class TestPdbColumnHandling:
         s = read_pdb(_write(tmp_path, "neg.pdb", pdb))
         assert [r.seq_id for r in s["A"]] == [-2, -1, 0]
         assert s["A"].sequence == "MAG"
+
+    def test_non_alphabetic_element_column_is_not_trusted(self, tmp_path):
+        """Legacy writers put charges and other junk in columns 77-78.
+
+        Trusting a digit there gave atoms element "1" and let a hydrogen named
+        "HB1" survive as a heavy atom, corrupting every distance and area.
+        """
+        pdb = """
+            ATOM      1  N   ALA A   1      11.104   6.134  -6.504  1.00 20.00           1
+            ATOM      2  CA  ALA A   1      11.639   6.399  -5.147  1.00 20.00           2
+            ATOM      3 HB1  ALA A   1      11.750   7.907  -4.912  1.00 20.00           1
+            ATOM      4  CB  ALA A   1      11.751   7.908  -4.913  1.00 20.00           C
+            END
+        """
+        s = read_pdb(_write(tmp_path, "digit.pdb", pdb))
+        assert [(a.name, a.element) for a in s["A"][0].atoms] == [
+            ("N", "N"), ("CA", "C"), ("CB", "C")]
 
     def test_four_character_hydrogen_names_are_not_mercury(self, tmp_path):
         """"HG11" is a gamma hydrogen, not mercury.
@@ -530,6 +561,101 @@ class TestHetatmOrdering:
         assert not s.warnings
 
 
+class TestFullSequence:
+    """SEQRES / _entity_poly give the chain as deposited. Without it, missing
+    *termini* are invisible -- and that is where a flank gets attached."""
+
+    def test_seqres_parsed_from_pdb(self, pdb):
+        assert len(pdb["A"].full_sequence) == 109
+        assert len(pdb["B"].full_sequence) == 15
+        assert pdb["B"].full_sequence == "SQ" + P53
+
+    def test_entity_poly_parsed_from_cif(self, cif):
+        assert len(cif["A"].full_sequence) == 109
+        assert cif["B"].full_sequence == "SQ" + P53
+
+    def test_pdb_and_cif_agree(self, pdb, cif):
+        for cid in pdb.chain_ids:
+            assert pdb[cid].full_sequence == cif[cid].full_sequence
+
+    def test_resolved_sequence_is_a_subsequence(self, pdb):
+        for chain in pdb:
+            assert chain.sequence in chain.full_sequence
+
+    def test_terminal_truncation_is_measured(self, pdb):
+        # Both chains of 1YCR are truncated, and chain_breaks() cannot see it.
+        assert pdb["A"].unresolved_termini() == (8, 16)
+        assert pdb["B"].unresolved_termini() == (2, 0)
+        assert pdb["A"].chain_breaks() == []
+        assert pdb["B"].chain_breaks() == []
+
+    def test_no_full_sequence_means_no_claim(self, tmp_path):
+        pdb_text = """
+            ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C
+            ATOM      2  CA  GLY A   2       3.800   0.000   0.000  1.00  0.00           C
+            END
+        """
+        s = read_pdb(_write(tmp_path, "noseqres.pdb", pdb_text))
+        assert s["A"].full_sequence == ""
+        assert s["A"].unresolved_termini() == (0, 0)
+
+
+class TestNumberingCollisions:
+    def test_duplicate_identity_is_reported(self, tmp_path):
+        """A chain whose numbering restarts must not silently lose atoms."""
+        pdb_text = """
+            ATOM      1  N   GLY A   1       0.000   0.000   0.000  1.00  0.00           N
+            ATOM      2  CA  GLY A   1       1.400   0.000   0.000  1.00  0.00           C
+            ATOM      3  N   ALA A   2       3.800   0.000   0.000  1.00  0.00           N
+            ATOM      4  CA  ALA A   2       5.200   0.000   0.000  1.00  0.00           C
+            ATOM      5  N   TRP A   1      20.000   0.000   0.000  1.00  0.00           N
+            ATOM      6  CA  TRP A   1      21.400   0.000   0.000  1.00  0.00           C
+            END
+        """
+        s = read_pdb(_write(tmp_path, "dup.pdb", pdb_text))
+        assert s["A"].sequence == "GA"
+        assert s.warnings, "collapsing residues must not be silent"
+
+    def test_clean_chain_has_no_such_warning(self, pdb):
+        assert not any("more than one" in w or "collides" in w
+                       for w in pdb.warnings)
+
+
+class TestCifAltlocFallback:
+    def test_sidechain_altlocs_do_not_split_a_residue(self, tmp_path):
+        """The standard pattern -- backbone unlabelled, sidechain A/B -- must
+        stay one residue when the residue number is unusable."""
+        cif = """
+            data_T
+            loop_
+            _atom_site.group_PDB
+            _atom_site.id
+            _atom_site.type_symbol
+            _atom_site.label_atom_id
+            _atom_site.label_alt_id
+            _atom_site.label_comp_id
+            _atom_site.label_asym_id
+            _atom_site.label_seq_id
+            _atom_site.Cartn_x
+            _atom_site.Cartn_y
+            _atom_site.Cartn_z
+            _atom_site.occupancy
+            ATOM 1 N N  . SER A . 0.0 0.0 0.0 1.00
+            ATOM 2 C CA . SER A . 1.4 0.0 0.0 1.00
+            ATOM 3 C C  . SER A . 2.4 0.0 0.0 1.00
+            ATOM 4 C CB A SER A . 3.0 1.0 0.0 0.60
+            ATOM 5 O OG A SER A . 3.5 2.0 0.0 0.60
+            ATOM 6 C CB B SER A . 3.1 1.1 0.0 0.40
+            ATOM 7 O OG B SER A . 3.6 2.1 0.0 0.40
+            ATOM 8 N N  . GLY A . 5.0 0.0 0.0 1.00
+            ATOM 9 C CA . GLY A . 6.4 0.0 0.0 1.00
+            #
+        """
+        s = read_cif(_write(tmp_path, "altfb.cif", cif))
+        assert s["A"].sequence == "SG"
+        assert len(s["A"]) == 2
+
+
 class TestHeteroatomRetention:
     """Skipped residues are dropped from the chains but their coordinates are
     kept, because they still occlude solvent."""
@@ -549,6 +675,35 @@ class TestHeteroatomRetention:
         assert sorted(elements) == ["Fe", "N"]
         assert s["A"].sequence == "A"
 
+    def test_skipped_residues_counts_residues_not_atoms(self, tmp_path):
+        """The field is named and displayed as a residue count."""
+        pdb = """
+            ATOM      1  CA  ALA A   1      11.639   6.399  -5.147  1.00 20.00           C
+            HETATM    2 FE   HEM A 200      30.000  30.000  30.000  1.00 20.00          FE
+            HETATM    3  NA  HEM A 200      31.000  30.000  30.000  1.00 20.00           N
+            HETATM    4  NB  HEM A 200      32.000  30.000  30.000  1.00 20.00           N
+            HETATM    5 FE   HEM A 201      40.000  30.000  30.000  1.00 20.00          FE
+            END
+        """
+        s = read_pdb(_write(tmp_path, "count.pdb", pdb))
+        assert s.skipped_residues == {"HEM": 2}
+        # coordinates are still kept per atom, for occlusion
+        assert s.heteroatoms()[0].shape == (4, 3)
+
+    def test_md_style_ion_names_are_treated_as_solvent(self, tmp_path):
+        """Simulation tools write NA+/CL-/MG2+ where the wwPDB writes NA/CL/MG."""
+        pdb = """
+            ATOM      1  CA  ALA A   1      11.639   6.399  -5.147  1.00 20.00           C
+            HETATM    2 NA   NA+ A 100      20.000  20.000  20.000  1.00 20.00          NA
+            HETATM    3 CL   CL- A 101      30.000  30.000  30.000  1.00 20.00          CL
+            HETATM    4 MG   MG2+A 102      40.000  40.000  40.000  1.00 20.00          MG
+            HETATM    5 FE   HEM A 200      50.000  50.000  50.000  1.00 20.00          FE
+            END
+        """
+        s = read_pdb(_write(tmp_path, "ions.pdb", pdb))
+        assert s.skipped_residues == {"HEM": 1}
+        assert s.heteroatoms()[1] == ["Fe"]
+
     def test_none_retained_for_a_clean_structure(self):
         s = read_structure(structure_path("1ycr.pdb"))
         coords, elements = s.heteroatoms()
@@ -563,6 +718,32 @@ class TestHeteroatomRetention:
             END
         """
         s = read_pdb(_write(tmp_path, "heth.pdb", pdb))
+        coords, elements = s.heteroatoms()
+        assert elements == ["C"]
+        assert coords.shape == (1, 3)
+
+    def test_cif_ligand_hydrogens_are_not_retained(self, tmp_path):
+        """A ligand hydrogen must not become a carbon-sized occluder when the
+        mmCIF omits type_symbol."""
+        cif = """
+            data_T
+            loop_
+            _atom_site.group_PDB
+            _atom_site.id
+            _atom_site.type_symbol
+            _atom_site.label_atom_id
+            _atom_site.label_comp_id
+            _atom_site.label_asym_id
+            _atom_site.label_seq_id
+            _atom_site.Cartn_x
+            _atom_site.Cartn_y
+            _atom_site.Cartn_z
+            ATOM   1 C  CA  ALA A 1 0.0 0.0 0.0
+            HETATM 2 ?  C1  LIG A 2 5.0 0.0 0.0
+            HETATM 3 ?  H1  LIG A 2 6.0 0.0 0.0
+            #
+        """
+        s = read_cif(_write(tmp_path, "hetel.cif", cif))
         coords, elements = s.heteroatoms()
         assert elements == ["C"]
         assert coords.shape == (1, 3)

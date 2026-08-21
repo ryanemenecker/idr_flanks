@@ -55,6 +55,32 @@ class TestReachRadius:
             reach_radius(0)
 
 
+class TestReachIsResidueAveraged:
+    """The radius must be the typical distance of a flank *residue* from the
+    anchor, not the end-to-end span, or the terminus choice stops mattering."""
+
+    def test_reach_is_below_end_to_end(self):
+        from idr_flanks.interface import end_to_end_distance
+        for n in (5, 10, 20, 30, 50, 100):
+            assert reach_radius(n) < end_to_end_distance(n)
+
+    def test_ratio_is_the_derived_factor(self):
+        from idr_flanks.interface import end_to_end_distance
+        for n in (20, 30, 50, 100):
+            ratio = reach_radius(n) / end_to_end_distance(n)
+            assert ratio == pytest.approx(1.0 / 1.52, rel=1e-6)
+
+    def test_termini_are_distinguishable_on_1ycr(self, ycr):
+        """The whole point of anchoring: the two termini must see different
+        surface. With the end-to-end radius they saw exactly the same 57
+        residues."""
+        n = set(find_proximal_region(ycr, "B", "A", "N", 25).seq_ids)
+        c = set(find_proximal_region(ycr, "B", "A", "C", 25).seq_ids)
+        jaccard = len(n & c) / len(n | c)
+        assert jaccard < 0.8
+        assert n != c
+
+
 class TestContactMap:
     def test_matches_brute_force(self, ycr):
         a, b = ycr["A"], ycr["B"]
@@ -490,6 +516,48 @@ class TestSequenceLocalityFilter:
         assert any("distinct interface patches" in n for n in region.notes)
 
 
+class TestTargetChainBreaks:
+    """Missing target residues expose surface they would have covered, so a
+    residue can be selected only because the model is incomplete."""
+
+    @pytest.fixture
+    def gapped_target(self, tmp_path):
+        kept = [l for l in open(structure_path("1ycr.pdb"))
+                if not (l.startswith("ATOM") and l[21] == "A"
+                        and l[22:26].strip().isdigit()
+                        and 63 <= int(l[22:26]) <= 66)]
+        p = tmp_path / "tgap.pdb"
+        p.write_text("".join(kept))
+        return read_structure(str(p))
+
+    def test_break_is_detected(self, gapped_target):
+        assert gapped_target["A"].chain_breaks() == [(62, 67)]
+
+    def test_region_reports_the_break(self, gapped_target):
+        region = find_proximal_region(gapped_target, "B", "A", "C", 25)
+        assert any("unresolved break" in n for n in region.notes)
+
+    def test_intact_target_is_not_flagged(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert not any("unresolved break" in n for n in region.notes)
+
+    def test_distant_break_is_not_flagged(self, tmp_path):
+        """A break far in sequence from the selection is not relevant."""
+        kept = [l for l in open(structure_path("1ycr.pdb"))
+                if not (l.startswith("ATOM") and l[21] == "A"
+                        and l[22:26].strip().isdigit()
+                        and 26 <= int(l[22:26]) <= 28)]
+        p = tmp_path / "far.pdb"
+        p.write_text("".join(kept))
+        region = find_proximal_region(read_structure(str(p)), "B", "A", "C", 25,
+                                      sequence_window=5, max_residues=6)
+        breaks = [n for n in region.notes if "unresolved break" in n]
+        if breaks:
+            # if reported, it must genuinely be near a selected residue
+            assert any(abs(s - 25) <= 10 or abs(s - 29) <= 10
+                       for s in region.seq_ids)
+
+
 class TestSmallPatchWarning:
     def test_note_when_few_residues_survive(self, ycr):
         region = find_proximal_region(ycr, "B", "A", "C", 20, max_residues=3)
@@ -525,6 +593,16 @@ class TestErrors:
         with pytest.raises(ValueError):
             find_proximal_region(ycr, "B", "A", "N", 10, anchor_residues=0)
 
+    def test_anchor_residues_larger_than_the_binder(self, ycr):
+        """Using the whole binder as the anchor makes the termini identical."""
+        with pytest.raises(ValueError, match="exceeds"):
+            find_proximal_region(ycr, "B", "A", "N", 10, anchor_residues=99)
+
+    def test_anchor_residues_equal_to_binder_length_is_allowed(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "N", 10,
+                                      anchor_residues=len(ycr["B"]))
+        assert len(region) > 0
+
     def test_chains_not_in_contact(self, ycr):
         with pytest.raises(InterfaceError, match="no heavy-atom contact"):
             find_proximal_region(ycr, "B", "A", "N", 10, contact_cutoff=0.5)
@@ -559,3 +637,138 @@ class TestFormatAgnostic:
         rc = find_proximal_region(cif, "B", "A", "C", 20)
         assert rp.seq_ids == rc.seq_ids
         assert rp.patch_sequence == rc.patch_sequence
+
+
+class TestDistalOcclusion:
+    """A predictor that drapes a sequence-distant region over the surface near
+    the binder would otherwise bury target surface that is really available,
+    discarding the region for a reason that is an artefact.
+    """
+
+    @staticmethod
+    def _residue(chain, num, name, x, y, z, serial):
+        out = []
+        for atom, element, dx in (("N", "N", 0.0), ("CA", "C", 1.4),
+                                  ("C", "C", 2.4), ("O", "O", 3.0)):
+            out.append(
+                f"ATOM  {serial:5d}  {atom:<3s} {name} {chain}{num:4d}    "
+                f"{x + dx:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          "
+                f"{element:>2s}\n")
+            serial += 1
+        return out, serial
+
+    @pytest.fixture
+    def draped(self, tmp_path):
+        """Local target region 50-56, with distal 500-506 and 520-526 sandwiched
+        against it."""
+        lines, sn = [], 1
+        for i in range(3):
+            block, sn = self._residue("B", i + 1, "GLY", i * 3.8, 0.0, 0.0, sn)
+            lines += block
+        for k, num in enumerate(range(50, 57)):
+            block, sn = self._residue("A", num, "SER", k * 3.8, 5.0, 0.0, sn)
+            lines += block
+        for k, num in enumerate(range(500, 507)):
+            block, sn = self._residue("A", num, "TRP", k * 3.8, 5.0, 3.0, sn)
+            lines += block
+        for k, num in enumerate(range(520, 527)):
+            block, sn = self._residue("A", num, "TRP", k * 3.8, 5.0, -3.0, sn)
+            lines += block
+        p = tmp_path / "draped.pdb"
+        p.write_text("".join(lines) + "END\n")
+        return read_pdb(str(p))
+
+    # A 40-residue flank so every local residue of the fixture (out to ~23 A
+    # from the anchor) is within reach; these tests are about occlusion, not
+    # about where the reach radius falls.
+    FLANK = 40
+
+    def _region(self, struct, trust, threshold=0.30):
+        return find_proximal_region(
+            struct, "B", "A", "N", self.FLANK, trust_distal_occlusion=trust,
+            min_cluster_contacts=2, sequence_window=25,
+            surface_threshold=threshold)
+
+    def test_distal_region_does_not_bury_local_surface(self, draped):
+        keep = self._region(draped, trust=False)
+        assert set(keep.seq_ids) == set(range(50, 57))
+
+    def test_trusting_it_buries_the_surface(self, draped):
+        """Opting in reproduces the artefact, which is the point of the flag."""
+        trusted = self._region(draped, trust=True)
+        assert len(trusted) < 7
+
+    def test_default_is_not_to_trust(self, draped):
+        default = find_proximal_region(draped, "B", "A", "N", self.FLANK,
+                                       min_cluster_contacts=2,
+                                       sequence_window=25,
+                                       surface_threshold=0.30)
+        assert set(default.seq_ids) == set(range(50, 57))
+
+    def test_exclusion_is_reported(self, draped):
+        region = self._region(draped, trust=False)
+        note = next((n for n in region.notes
+                     if "sequence-distant" in n and "accessibility" in n), None)
+        assert note is not None
+        # 14 distal residues sit against the candidates in this fixture.
+        assert "14 sequence-distant" in note
+
+    def test_note_counts_only_residues_that_could_occlude(self, ycr):
+        """Counting every sequence-distant residue in the chain would report
+        hundreds on a large target and imply far more was discarded than was."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert not any("sequence-distant" in n and "accessibility" in n
+                       for n in region.notes)
+
+    def test_note_absent_on_a_large_target_with_nothing_nearby(self, tmp_path):
+        """A distant region far away in space must not be counted at all."""
+        lines, sn = [], 1
+        for i in range(3):
+            block, sn = self._residue("B", i + 1, "GLY", i * 3.8, 0.0, 0.0, sn)
+            lines += block
+        for k, num in enumerate(range(50, 57)):
+            block, sn = self._residue("A", num, "SER", k * 3.8, 5.0, 0.0, sn)
+            lines += block
+        # 200 sequence-distant residues, but 500 A away: they occlude nothing.
+        for k, num in enumerate(range(500, 700)):
+            block, sn = self._residue("A", num, "TRP", k * 3.8, 500.0, 0.0, sn)
+            lines += block
+        p = tmp_path / "faraway.pdb"
+        p.write_text("".join(lines) + "END\n")
+        region = find_proximal_region(read_pdb(str(p)), "B", "A", "N",
+                                      self.FLANK, min_cluster_contacts=2,
+                                      sequence_window=25)
+        assert not any("sequence-distant" in n and "accessibility" in n
+                       for n in region.notes)
+
+    def test_real_structure_is_unaffected(self, ycr):
+        """With nothing sequence-distant, the flag must change nothing."""
+        a = find_proximal_region(ycr, "B", "A", "C", 25,
+                                 trust_distal_occlusion=False)
+        b = find_proximal_region(ycr, "B", "A", "C", 25,
+                                 trust_distal_occlusion=True)
+        assert a.seq_ids == b.seq_ids
+        assert a.patch_sequence == b.patch_sequence
+
+
+class TestBinderInterfaceReported:
+    def test_binder_interface_is_extracted(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 20)
+        # p53 residues that contact MDM2 within 5 A.
+        assert region.binder_interface_sequence == "ETFSLWLLPEN"
+        assert region.binder_interface_labels[0] == "B:17"
+
+    def test_it_is_a_subsequence_of_the_binder(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 20)
+        binder = ycr["B"].sequence
+        it = iter(binder)
+        assert all(c in it for c in region.binder_interface_sequence)
+
+    def test_reported_in_the_summary(self, ycr):
+        text = find_proximal_region(ycr, "B", "A", "C", 20).summary()
+        assert "binder interface" in text
+
+    def test_reversed_roles_give_the_other_interface(self, ycr):
+        region = find_proximal_region(ycr, "A", "B", "C", 20)
+        # now MDM2 is the binder, so its own contacting residues are reported
+        assert len(region.binder_interface_sequence) > 15

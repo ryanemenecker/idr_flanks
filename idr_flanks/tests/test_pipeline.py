@@ -159,12 +159,26 @@ class TestOutputs:
         assert "final construct" in text
         assert c_only.final_sequence in text.replace("[", "").replace("]", "")
 
-    def test_warnings_are_namespaced_by_terminus(self, pdb_path):
+    def test_warnings_are_namespaced_by_stage(self, pdb_path):
+        """Region and design warnings carry a terminus prefix; structure
+        warnings deliberately do not, since they describe the input file."""
         r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
                                  c_flank_length=20, preset="unconstrained",
                                  **FAST)
-        for w in r.warnings:
-            assert w.startswith(("N-terminal", "C-terminal"))
+        assert r.warnings, "1YCR is truncated, so warnings are expected"
+        structure = set(r.structure_warnings)
+        staged = [w for w in r.warnings if w not in structure]
+        assert staged, "expected at least one region or design warning"
+        for w in staged:
+            assert w.startswith(("N-terminal ", "C-terminal ")), w
+
+    def test_structure_warnings_are_not_prefixed(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=20, **FAST)
+        assert r.structure_warnings
+        for w in r.structure_warnings:
+            assert not w.startswith(("N-terminal ", "C-terminal "))
+            assert w in r.warnings
 
     def test_structure_is_retained(self, c_only):
         assert c_only.structure is not None
@@ -223,6 +237,42 @@ class TestArgumentRouting:
         design = r.designs["C"]
         assert design.patch_sequence == r.regions["C"].patch_sequence
         assert "weighted patch" not in design.summary()
+
+    def test_routing_set_matches_the_real_signature(self):
+        """Derived, not hand-listed: a parameter added to find_proximal_region
+        must route automatically instead of being rejected downstream."""
+        import inspect
+        from idr_flanks.interface import find_proximal_region
+        from idr_flanks.pipeline import _INTERFACE_KEYS
+        params = set(inspect.signature(find_proximal_region).parameters)
+        params -= {"structure", "binder_chain", "target_chain", "terminus",
+                   "flank_length"}
+        assert params == set(_INTERFACE_KEYS)
+
+    def test_no_ambiguous_option_names(self):
+        """No name may mean one thing to the interface and another to design."""
+        from idr_flanks.design import DesignConfig
+        from idr_flanks.pipeline import _INTERFACE_KEYS
+        assert not (set(DesignConfig.__dataclass_fields__) & set(_INTERFACE_KEYS))
+
+    def test_every_interface_parameter_is_accepted(self, pdb_path):
+        """Each routed parameter must be usable through the Python API."""
+        from idr_flanks.pipeline import _INTERFACE_KEYS
+        samples = {
+            "contact_cutoff": 5.5, "anchor_residues": 2, "radius": 20.0,
+            "radius_scale": 1.2, "max_radius": 40.0, "cluster_gap": 12,
+            "min_cluster_contacts": 2, "sequence_window": 30,
+            "max_residues": 10, "require_surface": True,
+            "surface_threshold": 0.12, "sasa_points": 120,
+            "trust_distal_occlusion": True,
+        }
+        assert set(samples) == set(_INTERFACE_KEYS), (
+            "update this test's sample values for new parameters")
+        for name, value in samples.items():
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=6, max_iterations=30,
+                                 num_starting_candidates=15, seed=1,
+                                 **{name: value})
 
     def test_unknown_option_is_rejected(self, pdb_path):
         with pytest.raises(TypeError):
@@ -361,6 +411,45 @@ class TestUnresolvedBinderResidues:
         assert s["B"].chain_breaks() == []
 
 
+class TestTruncatedTerminus:
+    """The terminus is where the flank attaches, so truncation there means the
+    anchor is the wrong atom."""
+
+    def test_attachment_terminus_truncation_warns_loudly(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 n_flank_length=12, **FAST)
+        assert any("N-terminus" in w and "truncated" in w
+                   and "wrong atom" in w for w in r.warnings)
+
+    def test_other_terminus_truncation_is_noted_as_harmless(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, **FAST)
+        assert any("does not affect the flank you asked for" in w
+                   for w in r.warnings)
+
+    def test_full_sequence_is_reported(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, **FAST)
+        assert r.binder_full_sequence == "SQ" + P53
+        assert r.binder_sequence == P53
+        assert "deposited" in r.summary()
+
+
+class TestRegionNotesReachWarnings:
+    def test_region_notes_are_surfaced(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, **FAST)
+        notes = r.regions["C"].notes
+        assert notes, "expected the region to report something"
+        for note in notes:
+            assert f"C-terminal region: {note}" in r.warnings
+
+    def test_small_patch_note_is_visible_programmatically(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, max_residues=3, **FAST)
+        assert any("survived the filters" in w for w in r.warnings)
+
+
 class TestErrors:
     def test_no_flank_requested(self, pdb_path):
         with pytest.raises(ValueError, match="must be positive"):
@@ -389,3 +478,172 @@ class TestReproducibility:
         a = build_flanked_binder(pdb_path, **kwargs)
         b = build_flanked_binder(pdb_path, **kwargs)
         assert a.final_sequence == b.final_sequence
+
+
+class TestLinker:
+    """A designed flank is chemically loaded on purpose; a short flexible linker
+    keeps it off the binder so it is less likely to perturb folding."""
+
+    def test_linker_is_inserted_on_the_c_side(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=10, linker_length=4, **FAST)
+        assert r.linker == "GSGS"
+        assert r.final_sequence == P53 + "GSGS" + r.c_flank
+
+    def test_linker_is_inserted_on_the_n_side(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 n_flank_length=10, linker_length=4, **FAST)
+        assert r.final_sequence == r.n_flank + "GSGS" + P53
+
+    def test_both_sides_get_a_linker(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 n_flank_length=8, c_flank_length=8,
+                                 linker_length=4, **FAST)
+        assert r.final_sequence == (r.n_flank + "GSGS" + P53 + "GSGS"
+                                    + r.c_flank)
+        assert r.added_residues == 8 + 8 + 8
+
+    def test_odd_linker_length(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=5, **FAST)
+        assert r.linker == "GSGSG"
+        assert len(r.linker) == 5
+
+    def test_explicit_linker_sequence(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=6,
+                                 linker_sequence="GGSGGS", **FAST)
+        assert r.linker == "GGSGGS"
+        assert r.final_sequence == P53 + "GGSGGS" + r.c_flank
+
+    def test_mismatched_linker_sequence_rejected(self, pdb_path):
+        with pytest.raises(ValueError, match="linker_length"):
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=4,
+                                 linker_sequence="GGSGGS", **FAST)
+
+    def test_linker_sequence_without_length_rejected(self, pdb_path):
+        with pytest.raises(ValueError, match="linker_length is 0"):
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_sequence="GSGS")
+
+    def test_non_amino_acid_linker_rejected(self, pdb_path):
+        with pytest.raises(ValueError, match="non-amino-acid"):
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=4,
+                                 linker_sequence="GZGS")
+
+    def test_linker_sequence_is_normalised(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=4,
+                                 linker_sequence="ggss", **FAST)
+        assert r.linker == "GGSS"
+
+    def test_negative_linker_rejected(self, pdb_path):
+        with pytest.raises(ValueError, match="cannot be negative"):
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=-2)
+
+    def test_no_linker_by_default(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, **FAST)
+        assert r.linker == ""
+        assert r.final_sequence == P53 + r.c_flank
+
+    def test_annotated_sequence_shows_the_linker(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=4, **FAST)
+        assert r.annotated_sequence() == f"{P53}(GSGS)[{r.c_flank}]"
+
+    def test_linker_extends_the_reach(self, pdb_path):
+        """The linker is part of the tether, so the flank can reach further."""
+        near = build_flanked_binder(pdb_path, binder_chain="B",
+                                    target_chain="A", c_flank_length=6,
+                                    linker_length=0, **FAST)
+        far = build_flanked_binder(pdb_path, binder_chain="B",
+                                   target_chain="A", c_flank_length=6,
+                                   linker_length=20, **FAST)
+        assert far.regions["C"].reach_radius > near.regions["C"].reach_radius
+
+    def test_linker_is_part_of_the_disorder_context(self, pdb_path, monkeypatch):
+        import idr_flanks.pipeline as mod
+        seen = []
+        real = mod.design_flank
+
+        def spy(patch, length, **kwargs):
+            seen.append((kwargs.get("n_context", ""), kwargs.get("c_context", "")))
+            return real(patch, length, **kwargs)
+
+        monkeypatch.setattr(mod, "design_flank", spy)
+        build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                             c_flank_length=8, linker_length=4, **FAST)
+        # A C-terminal flank sits after binder + linker, so that is its context.
+        assert seen == [(P53 + "GSGS", "")]
+
+    def test_fasta_records_the_linker(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=8, linker_length=4, **FAST)
+        assert "linker=GSGS" in r.fasta()
+
+
+class TestBinderInterfacePassedThrough:
+    def test_design_receives_the_binder_interface(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, **FAST)
+        design = r.designs["C"]
+        assert design.binder_interface_sequence == \
+               r.regions["C"].binder_interface_sequence
+        assert design.epsilon_vs_binder_interface == \
+               design.epsilon_vs_binder_interface
+
+    def test_flank_does_not_prefer_the_binder(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=20, seed=3,
+                                 max_iterations=300,
+                                 num_starting_candidates=120)
+        design = r.designs["C"]
+        assert (design.epsilon_vs_binder_interface
+                > design.epsilon_per_residue)
+
+
+class TestPublicApiSurface:
+    """The package's exports must stay in step with the modules' own __all__,
+    so a newly added public function cannot end up unreachable."""
+
+    def test_no_broken_exports(self):
+        import idr_flanks
+        assert [n for n in idr_flanks.__all__
+                if not hasattr(idr_flanks, n)] == []
+
+    def test_every_module_public_name_is_reachable(self):
+        import idr_flanks
+        from idr_flanks import design, interface, io, pipeline, sasa
+        for module in (io, sasa, interface, design, pipeline):
+            missing = [n for n in getattr(module, "__all__", [])
+                       if not hasattr(idr_flanks, n)]
+            assert missing == [], f"{module.__name__}: {missing}"
+
+    def test_feasibility_check_is_public(self):
+        """A user needs to test whether a terminus is worth designing for
+        before paying for a design run."""
+        import idr_flanks
+        assert callable(idr_flanks.target_discriminability)
+
+    def test_reference_data_is_public(self):
+        import idr_flanks
+        assert set(idr_flanks.idr_amino_acid_frequencies()) == set(
+            "ACDEFGHIKLMNPQRSTVWY")
+        assert idr_flanks.THREE_TO_ONE["MSE"] == "M"
+        assert idr_flanks.ATOMIC_RADII["C"] == pytest.approx(1.70)
+
+    def test_import_does_not_pull_in_goose(self):
+        """Structure work must not require the heavy optional stack."""
+        import subprocess
+        import sys as _sys
+        out = subprocess.run(
+            [_sys.executable, "-c",
+             "import sys, idr_flanks; "
+             "print('goose' in sys.modules, 'metapredict' in sys.modules)"],
+            capture_output=True, text=True, cwd=".")
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "False False"

@@ -66,15 +66,32 @@ interface*. Three filters, in order:
 
 **Reach from the attachment point.** Proximity is measured from an *anchor* —
 the binder's N- or C-terminal residue — not from the whole binder. A C-terminal
-flank cannot reach surface near the binder's N-terminus. The radius is the
-root-mean-square end-to-end distance of a disordered chain,
-`Ree = 6.2 · N^0.52` Å (≈20 Å at 10 residues, 36 Å at 30, 68 Å at 100) — the
-*typical* span, not the fully extended `3.5 · N`.
+flank cannot reach surface near the binder's N-terminus.
+
+The radius is the typical distance at which a flank *residue* sits from the
+anchor, not the end-to-end span of the whole flank. Only the last residue
+reaches `Ree`; averaging the tethered-chain relation over all residues gives
+`Ree / (1 + ν)`, which for `Ree = 6.2 · N^0.52` is ≈13 Å at 10 residues, 24 Å at
+30, 45 Å at 100. The factor is derived, not tuned.
+
+Using `Ree` itself as an equal-weight cutoff was measurably wrong: on 1YCR it
+selected the entire 85-residue target domain from *either* terminus, so both
+termini produced identical patches (Jaccard 1.00) and the terminus choice — the
+whole point of anchoring — did nothing. With the residue-averaged radius the two
+patches differ (Jaccard 0.42, 34 vs 47 residues), and the more focused patch
+gives a *stronger* per-residue signal (−0.156 vs −0.131).
+
+The provenance is worth stating precisely, because it is easy to overclaim: the
+exponent 0.52 and the prefactor come from the empirical IDR scaling
+`Rg ≈ 2.54 · N^0.522` converted with `Ree = √6 · Rg`, which is the *ideal-chain*
+relation. So 0.52 is an empirical fit close to the ideal-chain 0.5, below the
+self-avoiding-walk 0.588, and it varies with sequence charge and hydrophobicity.
+Treat the radius as an order-of-magnitude guide.
 
 **Solvent accessibility.** A flank cannot touch a buried residue. Per-residue
 SASA is computed with a Shrake–Rupley implementation in this package (validated
-against `mdtraj.shrake_rupley`: correlation 0.99994, mean absolute difference
-0.4 Å²) *in the context of the complex*, and residues below 10% relative
+against `mdtraj.shrake_rupley`: at the default 480 sample points, correlation
+0.99986 and mean absolute difference 0.56 Å²; 0.99994 and 0.40 Å² at 960) *in the context of the complex*, and residues below 10% relative
 accessibility are dropped. This matters a lot: on 1YCR, including buried core
 residues flips an acidic probe's epsilon against the patch from −5.2 (attractive)
 to +0.7 (repulsive).
@@ -84,6 +101,17 @@ returned as chains, but their heavy atoms are kept and used as occluders, so
 surface they cover is not offered up as somewhere a flank could bind. On
 haemoglobin the haem reduces the accessibility of 25 chain-A residues and pushes
 10 of them below the surface threshold.
+
+Sequence-distant target regions, however, are **excluded** from the occluder set
+by default. They are the same prediction artefact the sequence-locality filter
+exists to remove, and letting them occlude reintroduces it: a spuriously draped
+loop buries the very surface the flank could have used, and the region is
+discarded for a reason that is not real. On a constructed case where a distant
+region is draped over the reachable surface, trusting the drape collapses seven
+usable residues to one; ignoring it keeps all seven. Pass
+`trust_distal_occlusion=True` for an experimental structure, where such packing
+is genuine. On 1YCR, where nothing is sequence-distant, the setting changes
+nothing.
 
 **Sequence locality.** These are usually *predicted* structures, and predictors
 routinely place a sequence-distant part of the target next to the binder. The
@@ -123,7 +151,47 @@ is never mutated) against:
   is also gameable, so both are enforced.
 - **A composition envelope** — every residue capped at 3× its frequency in real
   IDRs (from GOOSE's `IDRProbs`, derived from the disordered regions of eleven
-  proteomes), plus group caps on W+F+Y (0.15) and A+I+L+M+V (0.30).
+  proteomes), plus group caps on W+F+Y and A+I+L+M+V.
+- **Not competing with the target for the binder** — the flank must prefer the
+  target patch to the binder's *own* target-binding surface by a margin.
+
+### Why the anti-competition guard matters
+
+If the flank likes the surface of the binder that grips the target, it competes
+with the target for it, and a "higher affinity" design ends up with *lower* net
+affinity. This is not hypothetical. Given an acidic target patch and an acidic
+binder interface, the unguarded design came out at −0.599 per residue against
+the target and **−0.624 against the binder's own interface** — it preferred the
+binder.
+
+The constraint is relative ("prefer the target by at least 0.05 per residue")
+rather than an absolute ban on binder attraction, because when the two surfaces
+share chemistry an absolute ban destroys the target attraction along with it
+(−0.587 → +0.016 in that case).
+
+Before applying it, the package checks whether the two surfaces can be told
+apart at all, by scanning single-chemistry probes for the best achievable
+preference. On 1YCR there is +0.716 per residue of headroom and the guard costs
+nothing — the same sequence comes out either way. On two chemically identical
+surfaces the headroom is +0.005, the constraint is unsatisfiable, and you are
+told so plainly instead of being handed a flank that competes. When the
+requested margin merely *exceeds* the headroom, the constraint is reduced to
+half of what is attainable rather than dropped — dropping it silently was
+measurably worse than keeping a weaker version.
+
+The 0.05 default is calibrated on six real complexes (1YCR, 1DFJ, 3HHR, 1BRS,
+1FCC, 2P1M):
+
+| margin | competing designs | mean target-affinity cost |
+|---|---|---|
+| none | **2 / 6** | — |
+| 0.02 | 0 / 6 | +0.013 |
+| 0.05 | 0 / 6 | +0.019 |
+
+Two of six real systems produce a competing flank with no guard — barstar
+against barnase at −0.168 preference, and protein G against Fc at −0.028. This
+is not a corner case. A margin of 0.05 eliminates it across all six for about
+0.02 per residue of target affinity.
 
 ### Why the composition envelope matters
 
@@ -160,16 +228,56 @@ the natural range (max single residue 0.23, complexity 0.65).
 The envelope costs roughly half the nominal epsilon. Most of what it gives up
 was never on-target affinity in the first place.
 
+### Why not just require high complexity?
+
+Sequence complexity looks like it should subsume all of this — a high-entropy
+sequence cannot be poly-anything. It does not work, measured:
+
+| constraint | achieved complexity | WFY | self-epsilon |
+|---|---|---|---|
+| none | 0.33 | 0.30 | +1.15 |
+| `Complexity ≥ 0.70` | 0.55 | **0.70** | **−0.41** |
+| `Complexity ≥ 0.90` | 0.50 | 0.63 | −0.02 |
+| composition envelope | **0.66** | 0.10 | +0.19 |
+
+Two problems. It is a *soft* objective, so GOOSE trades it against epsilon and
+never reaches the target — asking for 0.90 delivered 0.50. And it is blind to
+residue *identity*: `WQWFWPYYFWWWYDWWDWEYNFWDDFWWWD` uses eight residue types,
+so its entropy is respectable, and it is 70% aromatic and self-attractive.
+Requiring complexity actually made the flank *stickier* than requiring nothing.
+
+The envelope reaches complexity 0.66 without being asked, because bounding every
+residue's abundance forces diversity as a side effect. Adding `Complexity` on
+top of the envelope changes nothing measurable, so it is not used — complexity
+is reported as a diagnostic instead.
+
 An explicit anti-stickiness term is available
 (`max_decoy_epsilon_per_residue`, used by the `specific` preset) but is off by
 default: it is measurably redundant once the envelope is in place, and roughly
 2.5× the runtime.
 
+## Optional linker
+
+A designed flank is chemically loaded by construction, and butting it straight
+against the binder risks perturbing how the binder folds. `linker_length=N`
+inserts an `N`-residue GS linker between each flank and the binder:
+
+```python
+result = build_flanked_binder("complex.pdb", binder_chain="B",
+                             target_chain="A", c_flank_length=25,
+                             linker_length=6)
+# ETFSDLWKLLPEN(GSGSGS)[DPNPPEQHQDEWEYNENDNQPPEDP]
+```
+
+The linker is part of the tether, so it is included when working out how far the
+flank can reach, and it forms part of the sequence context used for the
+in-context disorder check. Supply `linker_sequence` for something other than GS.
+
 ## Presets
 
 | preset | intent |
 |---|---|
-| `balanced` | default: envelope 3×, W+F+Y ≤ 0.15, unbounded attraction |
+| `balanced` | default: envelope 3×, W+F+Y ≤ 0.10, unbounded attraction |
 | `soluble` | tighter envelope, few aromatics, explicit self-repulsion |
 | `specific` | tighter envelope plus a measured anti-stickiness constraint |
 | `aggressive` | wider envelope, chases affinity; check the reported numbers |
@@ -192,9 +300,14 @@ Every design reports:
 
 - **epsilon per residue** against the patch (negative = attractive), next to a
   background-composition reference so you can see how much is real signal;
-- **specificity** — how much more attracted the flank is to the patch than to
-  random sequence, plus its raw attraction to random sequence. A flank with
-  strong epsilon *and* strong random-sequence attraction is sticky, not potent;
+- **selectivity** — how much more attracted the flank is to the patch than to
+  random sequence, plus its raw attraction to random sequence. Read the second
+  number. The binder already supplies target specificity; the flank's job is
+  added avidity, so a modest selectivity margin is expected and is not flagged.
+  What does matter is the flank not attracting *everything*: strong epsilon
+  together with strong random-sequence attraction is stickiness, not potency;
+- **attraction to the binder's own interface** — positive means repelled, which
+  is what you want. Negative means it competes with the target;
 - **cross-reactivity** against basic / acidic / polar / flexible / aliphatic /
   aromatic decoys;
 - **self-epsilon** — positive means self-repulsive and soluble, negative flags
@@ -203,7 +316,16 @@ Every design reports:
 - composition: aromatic fraction, FCR, NCPR, κ.
 
 Warnings are raised automatically for self-attraction, low in-context disorder,
-attraction no better than background, low specificity, and generic stickiness.
+net repulsion from the patch, attraction no better than background (measured
+against 24 background draws, not one, since a single draw has a standard
+deviation of about a quarter of a typical design signal), generic stickiness, a
+patch too small to design against, unresolved residues in either chain, and —
+most importantly — the flank preferring the binder's own interface to the
+target.
+
+`FlankedBinder.warnings` collects all three stages, so `--quiet` and
+programmatic callers see the interface-stage notes too, not just the design
+ones.
 
 ## Honest limitations
 
@@ -217,9 +339,12 @@ attraction no better than background, low specificity, and generic stickiness.
   are the opposite: against an acidic patch the design reached −0.65 per residue
   and was more selective than all 1500 random controls. Check the reported
   specificity before trusting a design.
-- **Reach is a statistical estimate.** `Ree = 6.2 · N^0.52` is an ensemble
-  average for a generic disordered chain. It ignores excluded volume from the
-  target and any residual structure.
+- **Reach is a statistical estimate.** The radius is an ensemble average for a
+  generic disordered chain. It ignores excluded volume from the target, the
+  direction the binder terminus points (a flank cannot reach backwards through
+  the binder), the flank's own excluded volume, and any residual structure. It
+  is also an equal-weight cutoff: every residue inside the radius counts the
+  same, which is why proximity weighting is offered as an option.
 - **Small target domains saturate.** If the target is small relative to the
   flank's reach, most of its exposed surface is selected and the "patch" becomes
   the whole surface. Use `max_residues` or an explicit `radius` to focus, and
@@ -227,12 +352,20 @@ attraction no better than background, low specificity, and generic stickiness.
 - **Only the first model is read** from multi-model files unless you pass
   `model=`. Alternate locations are resolved by occupancy.
 - **Unresolved residues are unresolved.** A structure contains only what was
-  modelled. If the binder chain has a genuine backbone break, the returned
-  sequence is the resolved residues spliced together, not the real protein — the
-  package warns, and you should graft the designed flank onto your own
-  full-length sequence. Numbering jumps that are merely conventional (antibody
-  Kabat/Chothia numbering) are correctly *not* reported, since the check is
-  geometric.
+  modelled, and this matters more than it looks. The package reads SEQRES (or
+  `_entity_poly` in mmCIF) so it knows the deposited sequence, and warns about
+  two distinct problems:
+  - **Internal breaks**, detected geometrically from a missing peptide bond, so
+    conventional numbering jumps (antibody Kabat/Chothia) are correctly *not*
+    reported.
+  - **Truncated termini**, which a break check structurally cannot see, because
+    it can only compare residues that are present. This is the common case and
+    the dangerous one: the terminus is exactly where the flank attaches. Both
+    chains of the bundled 1YCR example are truncated — MDM2 by 8 and 16
+    residues, and the p53 binder by 2 at its N-terminus — so an N-terminal flank
+    there would be grafted two residues from where you expect, and the reach
+    would be measured from the wrong atom. The warning says so, and
+    `binder_full_sequence` gives you the sequence to graft onto instead.
 - **Adding a charged tail changes the whole molecule** — solubility, expression,
   pI, and possibly the binder's own fold. Nothing here models that.
 - `seed=` gives reproducible designs, but it also switches GOOSE to its

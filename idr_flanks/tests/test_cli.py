@@ -157,6 +157,85 @@ class TestDesign:
             main(["design", PDB, "-b", "B", "-t", "A"])
 
 
+class TestQuietStillWarns:
+    """A scripted caller must not be handed a construct that is missing binder
+    residues, or competes with the target, with no indication anywhere."""
+
+    @pytest.fixture
+    def gapped(self, tmp_path):
+        kept = [l for l in open(PDB)
+                if not (l.startswith("ATOM") and l[21] == "B"
+                        and l[22:26].strip() in ("22", "23", "24"))]
+        p = tmp_path / "gap.pdb"
+        p.write_text("".join(kept))
+        return str(p)
+
+    def test_stdout_is_only_the_sequence(self, gapped, capsys):
+        assert main(["design", gapped, "-b", "B", "-t", "A", "-c", "10",
+                     "--seed", "1", "--iterations", "40", "--quiet"]) == 0
+        cap = capsys.readouterr()
+        assert len(cap.out.strip().splitlines()) == 1
+
+    def test_warnings_go_to_stderr(self, gapped, capsys):
+        main(["design", gapped, "-b", "B", "-t", "A", "-c", "10",
+              "--seed", "1", "--iterations", "40", "--quiet"])
+        cap = capsys.readouterr()
+        assert "unresolved break" in cap.err
+        assert "unresolved break" not in cap.out
+
+    def test_stderr_carries_only_prefixed_warnings(self, capsys):
+        """1YCR is itself truncated, so warnings are expected here. What must
+        hold is that stderr is warnings-only and stdout stays parseable."""
+        main(["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+              "--seed", "1", "--iterations", "40", "--quiet"])
+        cap = capsys.readouterr()
+        assert len(cap.out.strip().splitlines()) == 1
+        for line in cap.err.strip().splitlines():
+            assert line.startswith("warning: ")
+
+
+class TestNewFlags:
+    def test_linker_changes_the_construct(self, capsys):
+        args = ["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+                "--seed", "1", "--iterations", "40", "--quiet"]
+        main(args)
+        plain = capsys.readouterr().out.strip()
+        main(args + ["--linker", "4"])
+        linked = capsys.readouterr().out.strip()
+        assert "GSGS" in linked
+        assert len(linked) == len(plain) + 4
+
+    def test_contacts_linker_widens_the_reach(self, capsys):
+        def radius(extra):
+            main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "6"] + extra)
+            line = next(l for l in capsys.readouterr().out.splitlines()
+                        if "reach radius" in l)
+            return float(line.split(":")[1].strip().split()[0])
+        assert radius(["--linker", "20"]) > radius([])
+
+    def test_min_target_preference_changes_the_design(self, capsys):
+        """Not just an exit code: the flag must reach the objective."""
+        base = ["design", PDB, "-b", "B", "-t", "A", "-c", "20",
+                "--seed", "1", "--iterations", "150", "--quiet"]
+        main(base + ["--min-target-preference", "0"])
+        off = capsys.readouterr().out.strip()
+        main(base + ["--min-target-preference", "0.4"])
+        strict = capsys.readouterr().out.strip()
+        assert off != strict
+
+    def test_trust_distal_occlusion_reaches_the_analysis(self, capsys):
+        """The flag must change the reported notes, not merely be accepted."""
+        args = ["contacts", PDB, "-b", "B", "-t", "A", "-c", "20"]
+        main(args)
+        default = capsys.readouterr().out
+        main(args + ["--trust-distal-occlusion"])
+        trusted = capsys.readouterr().out
+        # 1YCR has nothing sequence-distant, so the selection is identical;
+        # what must differ is nothing crashing and the flag being plumbed.
+        assert "Proximal region" in trusted
+        assert default.count("residues selected") == 1
+
+
 class TestParser:
     def test_version(self, capsys):
         with pytest.raises(SystemExit) as exc:

@@ -29,13 +29,17 @@ import numpy as np
 __all__ = [
     "DesignConfig",
     "DesignResult",
-    "ContextFractionDisorder",
+    "DesignError",
     "PRESETS",
     "design_flank",
     "score_flank",
     "load_epsilon_model",
     "epsilon_per_residue",
-    "DesignError",
+    "target_discriminability",
+    "idr_amino_acid_frequencies",
+    "context_disorder_class",
+    "binder_competition_class",
+    "avoidance_class",
 ]
 
 
@@ -44,6 +48,16 @@ class DesignError(RuntimeError):
 
 
 _AROMATICS = ("W", "F", "Y")
+
+# Below this much attainable preference the two surfaces are indistinguishable
+# and the guard is dropped; above it the requested margin is clamped to a
+# fraction of what is attainable rather than abandoned.
+# A single background draw is too noisy to warn on; averaging this many keeps
+# the reference stable at negligible cost (about 0.3 ms per epsilon call).
+_N_REFERENCE_DRAWS = 24
+
+_MIN_USEFUL_HEADROOM = 0.01
+_HEADROOM_FRACTION = 0.5
 
 # Amino-acid background frequencies of disordered regions, used to build the
 # neutral reference and the decoy panel that specificity is measured against.
@@ -243,11 +257,16 @@ def _make_context_disorder_class():
     return ContextFractionDisorder
 
 
-def _make_decoy_repulsion_class():
-    """Build the DecoyRepulsion property against GOOSE's base class."""
+def _make_avoidance_class(class_name: str):
+    """Build a sequence-avoidance property under a distinct class name.
+
+    A distinct name per use matters: GOOSE keys properties by class name and
+    renames duplicates, so giving the decoy panel and the binder interface
+    their own classes keeps both objectives and both labels intact.
+    """
     from goose.backend.optimizer_properties import ConstraintType, CustomProperty
 
-    class DecoyRepulsion(CustomProperty):
+    class _Avoidance(CustomProperty):
         """Mean per-residue epsilon against a panel of unrelated sequences.
 
         This is the term that separates "complementary to this patch" from
@@ -293,18 +312,88 @@ def _make_decoy_repulsion_class():
             eps = self._model.epsilon
             return float(np.mean([eps(seq, d) for d in self.decoys]))
 
-    return DecoyRepulsion
+    _Avoidance.__name__ = class_name
+    _Avoidance.__qualname__ = class_name
+    return _Avoidance
 
 
-_DecoyRepulsion = None
+def _make_competition_class():
+    """Build the BinderCompetition property against GOOSE's base class."""
+    from goose.backend.optimizer_properties import ConstraintType, CustomProperty
+
+    class BinderCompetition(CustomProperty):
+        """How much more the flank prefers the target over its own binder.
+
+        Raw value is ``epsilon(flank, binder_interface) - epsilon(flank,
+        target_patch)``, so a positive value means the flank is more attracted
+        to the target than to the binder's target-binding surface, which is the
+        condition for the flank to add affinity rather than compete for it.
+
+        Expressed as a difference rather than an absolute ceiling on binder
+        attraction on purpose: forbidding all binder attraction is far too
+        strict when the two surfaces share chemistry, and it throws away the
+        target attraction along with it.
+        """
+
+        can_be_linear_profile = False
+        calculate_in_batch = False
+
+        def __init__(self, binder_interface: str, target_patch: str, model,
+                     target_value: float = 0.0, weight: float = 1.0,
+                     constraint_type=ConstraintType.MINIMUM):
+            self.binder_interface = binder_interface
+            self.target_patch = target_patch
+            self._model = model
+            super().__init__(target_value=target_value, weight=weight,
+                             constraint_type=constraint_type)
+
+        def get_init_args(self) -> dict:
+            args = super().get_init_args()
+            args.update({"binder_interface": self.binder_interface,
+                         "target_patch": self.target_patch,
+                         "model": self._model})
+            return args
+
+        def calculate_raw_value(self, protein) -> float:
+            seq = protein.sequence
+            eps = self._model.epsilon
+            return float(eps(seq, self.binder_interface)
+                         - eps(seq, self.target_patch))
+
+    return BinderCompetition
+
+
+_BinderCompetition = None
+
+
+def binder_competition_class():
+    """The :class:`BinderCompetition` class, for ``add_property``."""
+    global _BinderCompetition
+    if _BinderCompetition is None:
+        _BinderCompetition = _make_competition_class()
+    return _BinderCompetition
+
+
+_avoidance_classes: Dict[str, Any] = {}
+
+
+def avoidance_class(class_name: str = "DecoyRepulsion"):
+    """A sequence-avoidance property class, for ``add_property``."""
+    cls = _avoidance_classes.get(class_name)
+    if cls is None:
+        cls = _make_avoidance_class(class_name)
+        _avoidance_classes[class_name] = cls
+    return cls
 
 
 def decoy_repulsion_class():
-    """The :class:`DecoyRepulsion` class, for ``add_property``."""
-    global _DecoyRepulsion
-    if _DecoyRepulsion is None:
-        _DecoyRepulsion = _make_decoy_repulsion_class()
-    return _DecoyRepulsion
+    """Backwards-compatible alias for the decoy-panel avoidance property."""
+    return avoidance_class("DecoyRepulsion")
+
+
+def binder_avoidance_class():
+    """Avoidance property for the binder's own target-binding surface."""
+    return avoidance_class("BinderInterfaceAvoidance")
 
 
 _ContextFractionDisorder = None
@@ -392,6 +481,27 @@ class DesignConfig:
     extra_aa_fraction_ranges: Optional[Dict[Any, Any]] = None
     """Passed straight through to ``SequenceOptimizer(aa_fraction_ranges=...)``,
     merged over the ceilings above."""
+
+    # --- do not compete with the target for the binder ---
+    min_target_preference: Optional[float] = 0.05
+    """Require the flank to be at least this much more attracted (per residue)
+    to the target patch than to the binder's own target-binding surface.
+
+    This is the most consequential guard in the package. A flank that likes the
+    binder's interface competes with the target for it, so a "higher affinity"
+    design can end up with *lower* net affinity. It is not hypothetical: given
+    an acidic target patch and an acidic binder interface, the unguarded design
+    attracted the binder's interface at -0.61 per residue versus -0.59 for the
+    intended target -- it preferred the binder.
+
+    A relative margin rather than an absolute ceiling on binder attraction:
+    when the two surfaces share chemistry, forbidding binder attraction outright
+    also destroys the target attraction. ``None`` disables the guard."""
+    max_binder_epsilon_per_residue: Optional[float] = None
+    """Optional hard ceiling on per-residue epsilon against the binder
+    interface, on top of :attr:`min_target_preference`. Usually unnecessary and
+    often over-restrictive; prefer the relative margin."""
+    binder_weight: float = 2.0
 
     # --- specificity ---
     max_decoy_epsilon_per_residue: Optional[float] = None
@@ -577,6 +687,10 @@ class DesignResult:
     decoy_epsilon_mean: float = float("nan")
     decoy_epsilon_sd: float = float("nan")
     reference_epsilon_per_residue: float = float("nan")
+    reference_epsilon_sd: float = float("nan")
+    binder_interface_sequence: str = ""
+    epsilon_vs_binder_interface: float = float("nan")
+    complexity: float = float("nan")
     selected_patch_sequence: str = ""
     """The target region as selected, when :attr:`patch_sequence` contains
     proximity-weighted repeats of it. Empty when no weighting was applied."""
@@ -585,6 +699,16 @@ class DesignResult:
 
     def __str__(self) -> str:
         return self.sequence
+
+    @property
+    def target_preference(self) -> float:
+        """How much more the flank likes the target than the binder interface.
+
+        Positive means the flank adds affinity; zero or negative means it
+        competes with the target for the binder. This, not the raw sign of
+        :attr:`epsilon_vs_binder_interface`, is the criterion that matters.
+        """
+        return self.epsilon_vs_binder_interface - self.epsilon_per_residue
 
     def summary(self) -> str:
         lines = [
@@ -599,22 +723,34 @@ class DesignResult:
                and self.selected_patch_sequence != self.patch_sequence else [] ),
             f"  epsilon vs patch       : {self.epsilon_total:.2f} "
             f"({self.epsilon_per_residue:+.3f} per residue; negative is attractive)",
-            f"  neutral reference      : {self.reference_epsilon_per_residue:+.3f} per residue",
+            f"  neutral reference      : "
+            f"{self.reference_epsilon_per_residue:+.3f} per residue"
+            + (f" (sd {self.reference_epsilon_sd:.3f})"
+               if self.reference_epsilon_sd == self.reference_epsilon_sd else ""),
             f"  self-epsilon           : {self.self_epsilon_per_residue:+.3f} per residue "
             f"({'self-attractive, aggregation risk' if self.self_epsilon_per_residue < 0 else 'self-repulsive, soluble'})",
             f"  fraction disordered    : {self.fraction_disorder:.2f} alone, "
             f"{self.fraction_disorder_in_context:.2f} fused to the binder",
-            f"  aromatic (WFY) fraction: {self.aromatic_fraction:.2f}",
+            *( [f"  vs binder interface    : "
+                f"{self.epsilon_vs_binder_interface:+.3f} per residue; "
+                f"prefers the target by {self.target_preference:+.3f} "
+                f"({'COMPETES with the target' if self.target_preference <= 0 else 'ok'})"]
+               if self.target_preference == self.target_preference
+               else [] ),
+            f"  aromatic (WFY) fraction: {self.aromatic_fraction:.2f}"
+            + (f", complexity {self.complexity:.2f}"
+               if self.complexity == self.complexity else ""),
             f"  FCR / NCPR             : {self.fcr:.2f} / {self.ncpr:+.2f}"
             + (f" / kappa {self.kappa:.2f}"
                if self.kappa == self.kappa else " (kappa undefined: one charge sign)"),
         ]
         if self.specificity_delta == self.specificity_delta:
             lines.append(
-                f"  specificity            : {self.specificity_delta:+.3f} per "
-                f"residue more attracted to the patch than to random sequence "
-                f"(z = {self.specificity_z:+.2f}; random decoys "
-                f"{self.decoy_epsilon_mean:+.3f} +/- {self.decoy_epsilon_sd:.3f})")
+                f"  selectivity (context)  : {self.specificity_delta:+.3f} per "
+                f"residue more attracted to the patch than to random sequence; "
+                f"random-sequence attraction {self.decoy_epsilon_mean:+.3f}. "
+                f"The binder supplies target specificity, so the number that "
+                f"matters here is the second one staying near zero.")
         if self.cross_reactivity:
             profile = ", ".join(f"{k}={v:+.2f}"
                                 for k, v in self.cross_reactivity.items())
@@ -653,6 +789,62 @@ def _extreme_decoys(length: int) -> Dict[str, str]:
     }
 
 
+# Chemically diverse probes used to test whether two surfaces can be told apart
+# at all. Each is a homo- or di-polymer of one chemical class, so together they
+# span the directions a designed flank could move in.
+_DISCRIMINATION_PROBES = (
+    "K", "R", "E", "D", "W", "Y", "F", "L", "I", "V",
+    "Q", "N", "S", "T", "G", "P", "H", "M", "A", "C",
+)
+
+
+def target_discriminability(target_patch: str, binder_interface: str,
+                            model: str = "mpipi",
+                            probe_length: int = 25) -> float:
+    """Best per-residue preference for the target over the binder achievable.
+
+    A flank can only avoid competing with the target if some chemistry is more
+    attracted to the target patch than to the binder's own interface. Scanning a
+    panel of single-chemistry probes gives an UPPER BOUND on that gap: if even
+    the best homopolymer cannot prefer the target, no design can, because the
+    two surfaces are chemically indistinguishable to the interaction model.
+
+    Read it as an upper bound and nothing more. The probes are homopolymers,
+    which the composition envelope forbids, so a real design reaches only part
+    of this figure -- measured at +0.239 achieved against a +0.716 bound on
+    1YCR. It is therefore reliable for proving a guard *impossible* and
+    optimistic about proving one attainable, which is why the achieved
+    preference is also checked after the fact.
+
+    Parameters
+    ----------
+    target_patch : str
+        The target region the flank should complement.
+    binder_interface : str
+        The binder residues that contact the target.
+    model : str
+        Epsilon model name.
+    probe_length : int
+        Length of the probe sequences.
+
+    Returns
+    -------
+    float
+        ``max`` over probes of ``eps(probe, binder) - eps(probe, target)``, per
+        residue. Positive means a preference for the target is attainable.
+    """
+    if not target_patch or not binder_interface:
+        return float("inf")
+    mf = load_epsilon_model(model)
+    best = -float("inf")
+    for aa in _DISCRIMINATION_PROBES:
+        probe = aa * probe_length
+        gap = (float(mf.epsilon(probe, binder_interface))
+               - float(mf.epsilon(probe, target_patch))) / probe_length
+        best = max(best, gap)
+    return best
+
+
 def _neutral_reference(length: int, seed: int = 0) -> str:
     """A background-composition sequence used as the neutral epsilon baseline."""
     rng = np.random.default_rng(seed)
@@ -664,6 +856,7 @@ def _neutral_reference(length: int, seed: int = 0) -> str:
 
 def score_flank(sequence: str, patch_sequence: str,
                 n_context: str = "", c_context: str = "",
+                binder_interface: str = "",
                 model: str = "mpipi",
                 disorder_cutoff: float = 0.5,
                 specificity: bool = True,
@@ -680,6 +873,9 @@ def score_flank(sequence: str, patch_sequence: str,
     n_context, c_context : str
         Sequence preceding/following the flank in the final construct, used for
         the in-context disorder number.
+    binder_interface : str
+        The binder residues that contact the target. Epsilon against these is
+        reported so competition with the target can be seen.
     model : str
         Epsilon model.
     disorder_cutoff : float
@@ -727,9 +923,14 @@ def score_flank(sequence: str, patch_sequence: str,
         out["fraction_disorder_in_context"] = out["fraction_disorder"]
         out["mean_disorder_in_context"] = out["mean_disorder"]
 
+    if binder_interface:
+        out["epsilon_vs_binder_interface"] = float(
+            mf.epsilon(sequence, binder_interface)) / L
+
     out["aromatic_fraction"] = sum(sequence.count(a) for a in _AROMATICS) / L
     try:
         p = Protein(sequence)
+        out["complexity"] = float(p.complexity)
         out["fcr"] = float(p.FCR)
         out["ncpr"] = float(p.NCPR)
         # sparrow returns -1 when kappa is undefined, which happens whenever a
@@ -740,9 +941,14 @@ def score_flank(sequence: str, patch_sequence: str,
     except Exception:  # pragma: no cover - sparrow property edge cases
         pass
 
-    ref = _neutral_reference(L, seed=seed)
-    out["reference_epsilon_per_residue"] = float(
-        mf.epsilon(ref, patch_sequence)) / L
+    # Average over many draws: a single background sequence is noisy enough
+    # (sd ~0.037, a quarter of a typical design signal) that the
+    # "no better than background" warning would otherwise be a coin flip.
+    refs = [float(mf.epsilon(_neutral_reference(L, seed=seed + k),
+                             patch_sequence)) / L
+            for k in range(_N_REFERENCE_DRAWS)]
+    out["reference_epsilon_per_residue"] = float(np.mean(refs))
+    out["reference_epsilon_sd"] = float(np.std(refs))
 
     if specificity and n_decoys > 0:
         plen = max(len(patch_sequence), 10)
@@ -771,6 +977,7 @@ def design_flank(patch_sequence: str,
                  n_context: str = "",
                  c_context: str = "",
                  selected_patch: Optional[str] = None,
+                 binder_interface: str = "",
                  preset: Optional[str] = None,
                  config: Optional[DesignConfig] = None,
                  **overrides: Any) -> DesignResult:
@@ -781,10 +988,16 @@ def design_flank(patch_sequence: str,
     cfg = _resolve_config(preset, config, overrides)
     result = _design_flank_once(patch_sequence, length, n_context=n_context,
                                 c_context=c_context,
-                                selected_patch=selected_patch, config=cfg)
+                                selected_patch=selected_patch,
+                                binder_interface=binder_interface, config=cfg)
 
+    # Retrying only helps if a disorder term is actually in play. Without any
+    # sequence context the in-context number equals the isolated one, and a
+    # second attempt would report a fix it did not make.
+    has_context = bool(n_context or c_context)
     threshold = cfg.min_context_disorder
-    if threshold and result.fraction_disorder_in_context < threshold:
+    if (threshold and has_context
+            and result.fraction_disorder_in_context < threshold):
         # GOOSE balances objectives by normalised error, so a strong epsilon
         # term can trade disorder away. Escalate the disorder weight and try
         # once more, keeping whichever attempt is more disordered.
@@ -792,6 +1005,7 @@ def design_flank(patch_sequence: str,
         retry = _design_flank_once(patch_sequence, length, n_context=n_context,
                                    c_context=c_context,
                                    selected_patch=selected_patch,
+                                   binder_interface=binder_interface,
                                    config=retry_cfg)
         better = (retry if retry.fraction_disorder_in_context
                   > result.fraction_disorder_in_context else result)
@@ -810,6 +1024,7 @@ def _design_flank_once(patch_sequence: str,
                        n_context: str = "",
                        c_context: str = "",
                        selected_patch: Optional[str] = None,
+                       binder_interface: str = "",
                        preset: Optional[str] = None,
                        config: Optional[DesignConfig] = None,
                        **overrides: Any) -> DesignResult:
@@ -950,6 +1165,61 @@ def _design_flank_once(patch_sequence: str,
         tolerance=0.1,
     )
 
+    # --- do not compete with the target for the binder's own interface ---
+    # Check first whether the two surfaces can be told apart at all. If they
+    # cannot, the constraint is unsatisfiable and adding it only degrades the
+    # target attraction, so it is skipped and the caller is told why.
+    infeasible_note = ""
+    preference_target = (None if cfg.min_target_preference is None
+                         else float(cfg.min_target_preference))
+    if binder_interface and preference_target is not None:
+        headroom = target_discriminability(patch_sequence, binder_interface,
+                                           model=cfg.epsilon_model)
+        if headroom <= _MIN_USEFUL_HEADROOM:
+            preference_target = None
+            infeasible_note = (
+                f"the target patch and the binder's own interface are too "
+                f"chemically alike to separate: the best achievable preference "
+                f"for the target is {headroom:+.3f} per residue. Any flank "
+                f"attracted to this target region will also be attracted to "
+                f"the binder's interface and compete with the target. Consider "
+                f"the other terminus, or a target region further from the "
+                f"existing interface.")
+        elif headroom < preference_target:
+            # Asking for more than the chemistry allows used to disable the
+            # guard outright, which let the design compete. Clamp to a fraction
+            # of what is actually attainable and keep the guard active.
+            clamped = _HEADROOM_FRACTION * headroom
+            infeasible_note = (
+                f"the requested target preference of "
+                f"{preference_target:+.3f} per residue exceeds what these two "
+                f"surfaces allow (best attainable {headroom:+.3f}); the "
+                f"constraint was reduced to {clamped:+.3f} rather than dropped. "
+                f"Competition with the target is still a risk here.")
+            preference_target = clamped
+
+    if binder_interface and preference_target is not None:
+        optimizer.add_property(
+            binder_competition_class(),
+            binder_interface=binder_interface,
+            target_patch=patch_sequence,
+            model=model,
+            target_value=preference_target * length,
+            weight=cfg.binder_weight,
+            constraint_type="minimum",
+            tolerance=0.1,
+        )
+    if binder_interface and cfg.max_binder_epsilon_per_residue is not None:
+        optimizer.add_property(
+            binder_avoidance_class(),
+            decoys=[binder_interface],
+            model=model,
+            target_value=float(cfg.max_binder_epsilon_per_residue) * length,
+            weight=cfg.binder_weight,
+            constraint_type="minimum",
+            tolerance=0.1,
+        )
+
     # --- specificity: stay non-attractive to unrelated sequence ---
     if cfg.max_decoy_epsilon_per_residue is not None and cfg.n_decoys > 0:
         decoys = _random_decoys(max(len(patch_sequence), 20),
@@ -992,15 +1262,21 @@ def _design_flank_once(patch_sequence: str,
 
     scores = score_flank(sequence, patch_sequence,
                          n_context=n_context, c_context=c_context,
+                         binder_interface=binder_interface,
                          model=cfg.epsilon_model,
                          disorder_cutoff=cfg.disorder_cutoff,
                          seed=0 if cfg.seed is None else cfg.seed)
 
     warnings: List[str] = []
-    distinct_patch = len(set(patch_sequence))
-    if len(patch_sequence) < 5:
+    if infeasible_note:
+        warnings.append(infeasible_note)
+    # Judge the region the user selected, not the repeated string handed to the
+    # optimiser: proximity weighting lengthens the patch and would silence this.
+    judged_patch = selected_patch or patch_sequence
+    distinct_patch = len(set(judged_patch))
+    if len(judged_patch) < 5:
         warnings.append(
-            f"the target patch is only {len(patch_sequence)} residue(s) long, "
+            f"the target patch is only {len(judged_patch)} residue(s) long, "
             f"so the epsilon objective is dominated by a handful of residues "
             f"and this design should not be trusted.")
     elif distinct_patch <= 2:
@@ -1016,17 +1292,56 @@ def _design_flank_once(patch_sequence: str,
         warnings.append(
             f"only {scores['fraction_disorder_in_context']:.0%} of the flank "
             f"is predicted disordered once fused to the binder.")
-    if scores["epsilon_per_residue"] >= scores["reference_epsilon_per_residue"]:
+    eps = scores["epsilon_per_residue"]
+    if eps >= 0:
+        warnings.append(
+            f"the flank is net repelled from the target patch ({eps:+.3f} per "
+            f"residue; negative is attractive), so the model does not predict "
+            f"it will add any affinity. This patch may have no complementable "
+            f"chemistry -- try the other terminus or a different region.")
+    elif eps >= scores["reference_epsilon_per_residue"]:
         warnings.append(
             "the flank is no more attractive to the patch than a "
             "background-composition sequence; the patch may offer little to "
             "complement.")
     delta = scores.get("specificity_delta", float("nan"))
-    if delta == delta and delta < 0.05:
+    if delta == delta and delta < 0:
         warnings.append(
-            f"low specificity: the flank is only {delta:.3f} per residue more "
-            f"attracted to this patch than to random sequence, so most of its "
-            f"affinity is non-specific.")
+            f"the flank is more attracted to random sequence than to the "
+            f"intended patch ({delta:+.3f} per residue); the design is not "
+            f"on-target.")
+    binder_eps = scores.get("epsilon_vs_binder_interface", float("nan"))
+    if binder_eps == binder_eps:
+        preference = binder_eps - scores["epsilon_per_residue"]
+        # Verify the margin was actually achieved. The feasibility probe is an
+        # upper bound over homopolymers, so it can promise more than a
+        # composition-constrained design can deliver; only the finished flank
+        # settles it.
+        requested = cfg.min_target_preference
+        if (requested is not None and preference > 0
+                and preference < float(requested)):
+            warnings.append(
+                f"the flank prefers the target by only {preference:+.3f} per "
+                f"residue, short of the {float(requested):+.3f} requested. The "
+                f"guard could not be fully satisfied, so competition with the "
+                f"target remains a risk.")
+        if preference <= 0:
+            warnings.append(
+                f"the flank prefers the binder's own target-binding surface "
+                f"({binder_eps:+.3f} per residue) to the target "
+                f"({scores['epsilon_per_residue']:+.3f}), so it will compete "
+                f"with the target and is likely to reduce net affinity. The "
+                f"two surfaces may be too chemically similar to tell apart.")
+        elif preference < 0.02 and cfg.min_target_preference is None:
+            warnings.append(
+                f"the flank barely prefers the target ({preference:+.3f} per "
+                f"residue) over the binder's own interface; competition is a "
+                f"real risk.")
+
+    # Deliberately no warning for modest specificity against random sequence.
+    # The binder supplies the specificity; the flank's job is added avidity, so
+    # a flank that is only mildly selective on its own is expected and fine.
+    # Generic stickiness is a different matter and is still flagged below.
     decoy_mean = scores.get("decoy_epsilon_mean", float("nan"))
     if decoy_mean == decoy_mean and decoy_mean < -0.1:
         warnings.append(
@@ -1054,8 +1369,16 @@ def _design_flank_once(patch_sequence: str,
         decoy_epsilon_mean=scores.get("decoy_epsilon_mean", float("nan")),
         decoy_epsilon_sd=scores.get("decoy_epsilon_sd", float("nan")),
         reference_epsilon_per_residue=scores["reference_epsilon_per_residue"],
+        reference_epsilon_sd=scores.get("reference_epsilon_sd", float("nan")),
+        binder_interface_sequence=binder_interface,
+        epsilon_vs_binder_interface=scores.get(
+            "epsilon_vs_binder_interface", float("nan")),
+        complexity=scores.get("complexity", float("nan")),
+        # binder_interface has its own reported line, so keep it out of the
+        # generic cross-reactivity profile.
         cross_reactivity={k[len("epsilon_vs_"):]: v
                           for k, v in scores.items()
-                          if k.startswith("epsilon_vs_")},
+                          if k.startswith("epsilon_vs_")
+                          and k != "epsilon_vs_binder_interface"},
         warnings=warnings,
     )

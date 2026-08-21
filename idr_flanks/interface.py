@@ -32,6 +32,7 @@ __all__ = [
     "find_proximal_region",
     "contact_map",
     "reach_radius",
+    "end_to_end_distance",
     "min_distances_to",
 ]
 
@@ -149,31 +150,64 @@ def contact_map(chain_a: Chain, chain_b: Chain,
 # ---------------------------------------------------------------------------
 
 # Root-mean-square end-to-end distance of a disordered chain, Ree = PREFACTOR *
-# N ** EXPONENT, in angstroms. The exponent is the self-avoiding-walk value
-# that IDR ensembles follow, and the prefactor is set so the relation
-# reproduces the widely used IDR radius-of-gyration scaling Rg ~ 2.54 * N**0.522
-# via Ree = sqrt(6) * Rg for an ideal chain.
+# N ** EXPONENT, in angstroms.
+#
+# Provenance, stated precisely because it is easy to overclaim: the exponent
+# 0.52 and prefactor come from the empirical IDR radius-of-gyration scaling
+# Rg ~ 2.54 * N**0.522 converted with Ree = sqrt(6) * Rg, which is the *ideal
+# chain* relation. 0.52 is therefore an empirical fit to IDR ensembles, close to
+# but not identical with the ideal-chain value of 0.5, and below the
+# self-avoiding-walk value of ~0.588. Real IDRs sit between those limits and the
+# exponent varies with sequence charge and hydrophobicity, so treat the radius
+# as an order-of-magnitude guide, not a measurement.
+_REACH_PREFACTOR_DOC = None
+# Two heavy atoms can only occlude each other's solvent shell within roughly
+# r_i + r_j + 2 * probe_radius; 7 A covers the largest protein pairing.
+_OCCLUSION_RANGE = 7.0
+
 _REACH_PREFACTOR = 6.2
 _REACH_EXPONENT = 0.52
+
+
+def end_to_end_distance(flank_length: int,
+                        prefactor: float = _REACH_PREFACTOR,
+                        exponent: float = _REACH_EXPONENT) -> float:
+    """RMS end-to-end distance of a disordered chain, in angstroms.
+
+    ``Ree = prefactor * N ** exponent``. This is the span of the *whole* chain,
+    which is why it is not used directly as the reach radius; see
+    :func:`reach_radius`.
+    """
+    if flank_length <= 0:
+        raise ValueError(f"flank_length must be positive, got {flank_length}")
+    return prefactor * float(flank_length) ** exponent
 
 
 def reach_radius(flank_length: int, prefactor: float = _REACH_PREFACTOR,
                  exponent: float = _REACH_EXPONENT,
                  minimum: float = 8.0,
                  maximum: Optional[float] = None) -> float:
-    """Distance a disordered flank of ``flank_length`` residues can span.
+    """Typical distance from the anchor at which a flank residue sits.
 
-    Uses the polymer scaling ``Ree = prefactor * N ** exponent``. This is the
-    root-mean-square end-to-end distance, so it is the typical -- not maximal --
-    reach; a fully extended chain would span roughly ``3.5 * N`` angstroms, but
-    a disordered chain spends almost none of its time extended.
+    Deliberately *not* the end-to-end distance. Only the last residue of the
+    flank reaches ``Ree``; averaging the tethered-chain relation over all
+    residues, ``mean_i(prefactor * i**exponent) = Ree / (1 + exponent)``, gives
+    the distance at which flank residues are actually found. The factor is
+    derived, not tuned.
+
+    Using ``Ree`` itself as a hard, equal-weight cutoff treats a target residue
+    at 33 A as being as relevant as one at 3 A, and it over-includes badly: on
+    1YCR it selected the entire 85-residue target domain from *either* terminus,
+    giving the two termini identical patches (Jaccard 1.00) and so removing the
+    terminus choice the package exists to make. With this definition the same
+    comparison gives Jaccard 0.44.
 
     Parameters
     ----------
     flank_length : int
-        Number of residues in the flank.
+        Number of residues in the flank, including any linker.
     prefactor, exponent : float
-        Scaling parameters; see module source for their provenance.
+        Polymer scaling parameters; see the module source for provenance.
     minimum : float
         Floor on the returned radius, so a very short flank still sees the
         residues immediately around its attachment point.
@@ -185,10 +219,8 @@ def reach_radius(flank_length: int, prefactor: float = _REACH_PREFACTOR,
     float
         Radius in angstroms.
     """
-    if flank_length <= 0:
-        raise ValueError(f"flank_length must be positive, got {flank_length}")
-    r = prefactor * float(flank_length) ** exponent
-    r = max(r, minimum)
+    ree = end_to_end_distance(flank_length, prefactor, exponent)
+    r = max(ree / (1.0 + exponent), minimum)
     if maximum is not None:
         r = min(r, maximum)
     return r
@@ -234,6 +266,10 @@ class ProximalRegion:
     reach_radius: float
     contact_labels: List[str] = field(default_factory=list)
     excluded_labels: List[str] = field(default_factory=list)
+    binder_interface_sequence: str = ""
+    """The binder's own residues that contact the target. A flank attracted to
+    these would compete with the target for the binder."""
+    binder_interface_labels: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
     def __len__(self) -> int:
@@ -361,6 +397,9 @@ class ProximalRegion:
             f"  spans               : " + (self._span_text() or "none"),
             f"  patch sequence      : {self.patch_sequence or '(empty)'}",
             f"  interface contacts  : {len(self.contact_labels)}",
+            f"  binder interface    : {self.binder_interface_sequence or '(none)'}"
+            f" ({len(self.binder_interface_labels)} residues; the flank must "
+            f"not compete for these)",
         ]
         rel = [r.relative_sasa for r in self.residues
                if r.relative_sasa == r.relative_sasa]
@@ -427,6 +466,7 @@ def find_proximal_region(
     require_surface: bool = True,
     surface_threshold: float = 0.10,
     sasa_points: int = 480,
+    trust_distal_occlusion: bool = False,
 ) -> ProximalRegion:
     """Select the target residues a new flank should be complementary to.
 
@@ -473,6 +513,13 @@ def find_proximal_region(
     sasa_points : int
         Test points per atom for the accessibility calculation. Lower is
         faster; the default is far more than surface classification needs.
+    trust_distal_occlusion : bool
+        Whether target residues that fail the sequence-locality test may still
+        occlude solvent. Default ``False``: a predictor that drapes a distant
+        part of the target over the region of interest would otherwise bury
+        surface that is really available to the flank, and the region would be
+        discarded for a reason that is an artefact. Set ``True`` for an
+        experimental structure, where such packing is real.
 
     Returns
     -------
@@ -510,6 +557,11 @@ def find_proximal_region(
     if anchor_residues < 1:
         raise ValueError(
             f"anchor_residues must be at least 1, got {anchor_residues}")
+    if anchor_residues > len(binder):
+        raise ValueError(
+            f"anchor_residues={anchor_residues} exceeds the {len(binder)} "
+            f"residues in chain {binder_chain!r}. Using the whole binder as the "
+            f"anchor makes the two termini indistinguishable.")
     if max_residues is not None and max_residues < 1:
         raise ValueError(
             f"max_residues must be at least 1 if given, got {max_residues}")
@@ -598,40 +650,51 @@ def find_proximal_region(
     # --- 4. solvent accessibility, measured in the complex ---
     # A flank can only interact with target surface, and it has to be surface
     # that is still exposed once the binder is bound.
-    rel_sasa = np.full(len(target), np.nan)
-    if require_surface:
-        other_chains = [res for cid, chain in structure.chains.items()
-                        if cid != target_chain for res in chain.residues]
-        # Only residues within reach can be selected, so only they need an
-        # accessibility number. The rest of the target still has to occlude, so
-        # it moves into the context. This is bit-identical to computing the
-        # whole chain and several times faster on a large target, where the
-        # Shrake-Rupley pass otherwise dominates the call.
-        in_reach = [i for i in range(len(target))
-                    if np.isfinite(d_anchor[i]) and d_anchor[i] <= r]
-        if in_reach:
-            reachable = [target.residues[i] for i in in_reach]
-            out_of_reach = [target.residues[i] for i in range(len(target))
-                            if i not in set(in_reach)]
-            het_xyz, het_els = structure.heteroatoms()
-            values = relative_residue_sasa(
-                reachable, context=other_chains + out_of_reach,
-                n_points=sasa_points,
-                extra_coords=het_xyz, extra_elements=het_els)
-            rel_sasa[in_reach] = values
-
-    # --- 5. combine ---
-    selected: List[ProximalResidue] = []
+    # Candidates are residues that are both within reach and sequence-local to
+    # a trusted interface patch. The sequence filter is applied *before*
+    # accessibility, not after, so a sequence-distant region cannot bury the
+    # surface it was spuriously placed on top of.
+    candidate_idx: List[int] = []
     excluded: List[str] = []
-    n_buried = 0
     for i, res in enumerate(target.residues):
         if not np.isfinite(d_anchor[i]) or d_anchor[i] > r:
             continue
+        if sequence_local(int(res.seq_id)):
+            candidate_idx.append(i)
+        else:
+            excluded.append(res.label)
+
+    rel_sasa = np.full(len(target), np.nan)
+    if require_surface and candidate_idx:
+        other_chains = [res for cid, chain in structure.chains.items()
+                        if cid != target_chain for res in chain.residues]
+        # Distal target regions are the same prediction artefact the
+        # sequence-locality filter exists to remove. Letting them occlude would
+        # reintroduce it through the back door: a spuriously draped loop would
+        # bury the very surface the flank could use, and the region would be
+        # discarded for a reason that is not real.
+        candidate_set = set(candidate_idx)
+        occluders = [
+            target.residues[i] for i in range(len(target))
+            if i not in candidate_set
+            and (trust_distal_occlusion
+                 or sequence_local(int(target.residues[i].seq_id)))]
+        # Only candidates need an accessibility number, which also keeps the
+        # Shrake-Rupley pass off the rest of a large chain.
+        het_xyz, het_els = structure.heteroatoms()
+        rel_sasa[candidate_idx] = relative_residue_sasa(
+            [target.residues[i] for i in candidate_idx],
+            context=other_chains + occluders,
+            n_points=sasa_points,
+            extra_coords=het_xyz, extra_elements=het_els)
+
+    # --- 5. combine ---
+    selected: List[ProximalResidue] = []
+    n_buried = 0
+    for i in candidate_idx:
+        res = target.residues[i]
         if require_surface and not (rel_sasa[i] > surface_threshold):
             n_buried += 1
-            continue
-        if not sequence_local(int(res.seq_id)):
-            excluded.append(res.label)
             continue
         selected.append(ProximalResidue(
             residue=res,
@@ -644,6 +707,34 @@ def find_proximal_region(
     if n_buried:
         notes.append(f"{n_buried} residue(s) within reach were buried "
                      f"(relative SASA <= {surface_threshold}) and excluded.")
+    if require_surface and not trust_distal_occlusion and candidate_idx:
+        # Count only the sequence-distant residues that were close enough to a
+        # candidate to actually have occluded it. Counting every distant
+        # residue in the chain would report hundreds on a large target and
+        # imply far more was discarded than really was.
+        cand_set = set(candidate_idx)
+        distal = [target.residues[i] for i in range(len(target))
+                  if i not in cand_set
+                  and not sequence_local(int(target.residues[i].seq_id))]
+        n_distal = 0
+        if distal:
+            blocks = [target.residues[i].heavy_coords for i in candidate_idx]
+            cand_coords = (np.vstack([b for b in blocks if b.size])
+                           if any(b.size for b in blocks)
+                           else np.empty((0, 3)))
+            if cand_coords.shape[0]:
+                for res in distal:
+                    hc = res.heavy_coords
+                    if hc.size and _nearest_distance(
+                            hc, cand_coords).min() <= _OCCLUSION_RANGE:
+                        n_distal += 1
+        if n_distal:
+            notes.append(
+                f"{n_distal} sequence-distant target residue(s) were close "
+                f"enough to bury reachable surface but were excluded from the "
+                f"accessibility calculation, so a predicted misplacement "
+                f"cannot hide a usable region. Pass "
+                f"trust_distal_occlusion=True for an experimental structure.")
 
     if max_residues is not None and len(selected) > max_residues:
         by_distance = sorted(selected, key=lambda p: p.anchor_distance)
@@ -670,6 +761,24 @@ def find_proximal_region(
             f"terminus, a longer flank, or a larger radius."
         )
 
+    # Unresolved residues in the TARGET matter too: whatever they would have
+    # covered now reads as exposed, so a residue can be selected only because
+    # its neighbours are missing from the model.
+    target_breaks = target.chain_breaks()
+    if target_breaks and selected:
+        chosen = {p.seq_id for p in selected}
+        near = [(a, b) for a, b in target_breaks
+                if any(a - sequence_window <= s <= b + sequence_window
+                       for s in chosen)]
+        if near:
+            notes.append(
+                f"target chain {target_chain!r} has unresolved break(s) near "
+                f"the selected region ("
+                + ", ".join(f"{a}->{b}" for a, b in near[:5])
+                + "). Surface those missing residues would have covered reads "
+                  "as exposed here, so some selected residues may not really "
+                  "be accessible in the intact protein.")
+
     if len(selected) < 5:
         notes.append(
             f"only {len(selected)} residue(s) survived the filters. A patch "
@@ -686,6 +795,13 @@ def find_proximal_region(
             f"prediction artefacts."
         )
 
+    # The binder's own target-contacting residues, so the design step can be
+    # told what not to compete with.
+    target_coords, _ = target.stacked_heavy_coords()
+    d_target = min_distances_to(binder, target_coords)
+    binder_iface = [binder.residues[i]
+                    for i in np.nonzero(d_target <= contact_cutoff)[0]]
+
     return ProximalRegion(
         residues=selected,
         target_chain_id=target_chain,
@@ -695,5 +811,7 @@ def find_proximal_region(
         reach_radius=r,
         contact_labels=[target[i].label for i in contact_idx],
         excluded_labels=excluded,
+        binder_interface_sequence="".join(r.one_letter for r in binder_iface),
+        binder_interface_labels=[r.label for r in binder_iface],
         notes=notes,
     )

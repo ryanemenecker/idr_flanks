@@ -36,10 +36,13 @@ from .interface import (
     ProximalRegion,
     ProximalResidue,
     contact_map,
+    end_to_end_distance,
     find_proximal_region,
+    min_distances_to,
     reach_radius,
 )
 from .io import (
+    THREE_TO_ONE,
     Atom,
     Chain,
     Residue,
@@ -49,14 +52,23 @@ from .io import (
     read_pdb,
     read_structure,
 )
-from .sasa import relative_residue_sasa, residue_sasa, solvent_accessible_mask
+from .sasa import (
+    ATOMIC_RADII,
+    MAX_SASA,
+    relative_residue_sasa,
+    residue_sasa,
+    solvent_accessible_mask,
+    sphere_points,
+)
 
 
 def __getattr__(name):
     """Expose the design/pipeline API without importing GOOSE at import time."""
     _design = {"DesignConfig", "DesignError", "DesignResult", "PRESETS",
                "design_flank", "score_flank", "epsilon_per_residue",
-               "load_epsilon_model"}
+               "load_epsilon_model", "target_discriminability",
+               "idr_amino_acid_frequencies", "context_disorder_class",
+               "binder_competition_class", "avoidance_class"}
     _pipeline = {"FlankedBinder", "build_flanked_binder", "describe_chains"}
     if name in _design:
         from . import design
@@ -78,17 +90,23 @@ __all__ = [
     "read_structure",
     "read_pdb",
     "read_cif",
+    "THREE_TO_ONE",
     # surface
     "residue_sasa",
     "relative_residue_sasa",
     "solvent_accessible_mask",
+    "sphere_points",
+    "ATOMIC_RADII",
+    "MAX_SASA",
     # interface
     "InterfaceError",
     "ProximalRegion",
     "ProximalResidue",
     "find_proximal_region",
     "contact_map",
+    "min_distances_to",
     "reach_radius",
+    "end_to_end_distance",
     # design (lazily imported)
     "DesignConfig",
     "DesignError",
@@ -98,6 +116,11 @@ __all__ = [
     "score_flank",
     "epsilon_per_residue",
     "load_epsilon_model",
+    "target_discriminability",
+    "idr_amino_acid_frequencies",
+    "context_disorder_class",
+    "binder_competition_class",
+    "avoidance_class",
     # pipeline (lazily imported)
     "FlankedBinder",
     "build_flanked_binder",

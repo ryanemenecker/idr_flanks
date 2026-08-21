@@ -119,13 +119,17 @@ class TestRelativeSasa:
         assert np.all(np.isfinite(rel))
 
     def test_glycine_normalised_by_backbone(self, chains):
+        """Pin the exact deviation from FINCHES: glycine is divided by its
+        BACKBONE reference, since its sidechain reference is zero."""
         a, _ = chains
+        absolute = residue_sasa(a)
         rel = relative_residue_sasa(a)
-        gly = [rel[i] for i, r in enumerate(a) if r.resname == "GLY"]
+        gly = [i for i, r in enumerate(a) if r.resname == "GLY"]
         assert gly, "1YCR chain A should contain glycines"
-        # Finite and in a sensible range, rather than the inf a zero sidechain
-        # reference would give.
-        assert all(0.0 <= g <= 1.5 for g in gly)
+        backbone_ref = MAX_SASA["G"][1]
+        for i in gly:
+            assert rel[i] == pytest.approx(absolute[i] / backbone_ref)
+        assert MAX_SASA["G"][0] == 0.0, "sidechain reference must be zero"
 
     def test_glycine_can_be_buried(self, chains):
         """Glycine must be able to read as buried, not always as surface.

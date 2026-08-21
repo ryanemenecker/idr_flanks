@@ -439,14 +439,188 @@ class TestWarnings:
         assert not any("residue(s) long" in w for w in r.warnings)
 
     def test_warns_about_generic_stickiness(self):
-        """An unconstrained design should be flagged if it goes sticky."""
+        """An unconstrained design that goes sticky must name the problem."""
         r = design_flank(PATCH, 30, c_context=BINDER, seed=3,
                          preset="unconstrained", max_iterations=300,
                          num_starting_candidates=100)
-        if r.self_epsilon_per_residue < 0 or r.decoy_epsilon_mean < -0.1:
-            assert r.warnings
+        # The preset exists to reproduce the pathology, so at least one of the
+        # two signatures must be present and flagged by the matching warning.
+        assert (r.self_epsilon_per_residue < 0
+                or r.decoy_epsilon_mean < -0.1), (
+            r.self_epsilon_per_residue, r.decoy_epsilon_mean)
+        if r.self_epsilon_per_residue < 0:
+            assert any("aggregate" in w for w in r.warnings), r.warnings
+        if r.decoy_epsilon_mean < -0.1:
+            assert any("generically sticky" in w for w in r.warnings), r.warnings
 
     def test_no_spurious_warnings_on_a_good_design(self):
         r = design_flank(PATCH, 30, c_context=BINDER, seed=4,
                          max_iterations=400, num_starting_candidates=100)
         assert not any("aggregate" in w for w in r.warnings)
+
+
+class TestBinderCompetition:
+    """A flank attracted to the binder's own target-binding surface competes
+    with the target for it, so a stronger design can mean weaker net affinity.
+    """
+
+    # Constructed so the target patch and the binder interface share chemistry:
+    # both acidic, so the complementary flank is basic and likes both.
+    ACIDIC_TARGET = "DEEDSDEEDSDDEESDDEE"
+    ACIDIC_IFACE = "DEEDLDEEFDDEE"
+    ACIDIC_BINDER = "GSGS" + ACIDIC_IFACE + "GSGS"
+
+    def test_discriminability_high_when_surfaces_differ(self):
+        from idr_flanks.design import target_discriminability
+        # The real 1YCR pairing: a basic/polar target patch against a
+        # hydrophobic/acidic binder interface.
+        gap = target_discriminability(PATCH, "ETFSLWLLPEN")
+        assert gap > 0.2
+
+    def test_discriminability_zero_for_identical_surfaces(self):
+        from idr_flanks.design import target_discriminability
+        assert target_discriminability(PATCH, PATCH) == pytest.approx(0.0, abs=1e-9)
+
+    def test_discriminability_low_for_similar_chemistry(self):
+        from idr_flanks.design import target_discriminability
+        gap = target_discriminability(self.ACIDIC_TARGET, self.ACIDIC_IFACE)
+        assert gap < 0.05
+
+    def test_no_context_means_infinite_headroom(self):
+        from idr_flanks.design import target_discriminability
+        assert target_discriminability(PATCH, "") == float("inf")
+
+    def test_binder_epsilon_is_reported(self):
+        r = design_flank(PATCH, 20, n_context=BINDER,
+                         binder_interface="ETFSLWLLPEN", seed=1, **FAST)
+        assert r.binder_interface_sequence == "ETFSLWLLPEN"
+        assert r.epsilon_vs_binder_interface == r.epsilon_vs_binder_interface
+
+    def test_guard_is_free_when_surfaces_differ(self):
+        """On a real pairing the guard should cost nothing."""
+        common = dict(n_context=BINDER, binder_interface="ETFSLWLLPEN",
+                      seed=1, max_iterations=300, num_starting_candidates=120)
+        guarded = design_flank(PATCH, 25, **common)
+        unguarded = design_flank(PATCH, 25, min_target_preference=None, **common)
+        assert guarded.epsilon_per_residue == pytest.approx(
+            unguarded.epsilon_per_residue, abs=0.03)
+        assert guarded.epsilon_vs_binder_interface > guarded.epsilon_per_residue
+
+    def test_competition_is_warned_about(self):
+        r = design_flank(self.ACIDIC_TARGET, 25,
+                         n_context=self.ACIDIC_BINDER,
+                         binder_interface=self.ACIDIC_IFACE, seed=1,
+                         max_iterations=250, num_starting_candidates=100)
+        assert any("prefers the binder" in w or "too chemically alike" in w
+                   for w in r.warnings)
+
+    def test_unsatisfiable_guard_is_reported_not_silently_applied(self):
+        """When the surfaces cannot be told apart, say so rather than wrecking
+        the target attraction chasing an impossible constraint."""
+        r = design_flank(self.ACIDIC_TARGET, 25,
+                         n_context=self.ACIDIC_BINDER,
+                         binder_interface=self.ACIDIC_IFACE, seed=1,
+                         max_iterations=250, num_starting_candidates=100)
+        assert any("too chemically alike" in w for w in r.warnings)
+        # target attraction is preserved rather than sacrificed
+        assert r.epsilon_per_residue < -0.2
+
+    def test_margin_beyond_headroom_is_clamped_not_dropped(self):
+        """Asking for more preference than the chemistry allows must reduce the
+        constraint, not abandon it.
+
+        Dropping it silently let the design compete: on protein G / Fc
+        (attainable headroom +0.059) a requested margin of 0.10 disabled the
+        guard and produced a flank preferring the binder by -0.028.
+        """
+        # This pairing has about +0.80 per residue of attainable headroom, so
+        # asking for 1.5 is beyond it but far from indistinguishable.
+        from idr_flanks.design import target_discriminability
+        iface = "DEEDLDEEFDDEEKKR"
+        headroom = target_discriminability(self.ACIDIC_TARGET, iface)
+        assert 0.01 < headroom < 1.5, headroom
+        r = design_flank(self.ACIDIC_TARGET, 25,
+                         n_context=self.ACIDIC_BINDER,
+                         binder_interface=iface,
+                         min_target_preference=1.5, seed=7,
+                         max_iterations=200, num_starting_candidates=80)
+        assert any("reduced to" in w for w in r.warnings)
+        assert not any("chemically alike" in w for w in r.warnings)
+
+    def test_guard_dropped_only_when_truly_indistinguishable(self):
+        r = design_flank(PATCH, 20, n_context=BINDER, binder_interface=PATCH,
+                         seed=1, **FAST)
+        # patch against itself: no preference is attainable at all
+        assert any("chemically alike" in w for w in r.warnings)
+        assert not any("reduced to" in w for w in r.warnings)
+
+    def test_no_binder_interface_means_no_guard(self):
+        r = design_flank(PATCH, 20, n_context=BINDER, seed=1, **FAST)
+        assert r.binder_interface_sequence == ""
+        assert r.epsilon_vs_binder_interface != r.epsilon_vs_binder_interface
+
+
+class TestFailureWarnings:
+    """A design that cannot work must say so, not report a clean success."""
+
+    REPELLED = dict(composition_envelope=None, max_aromatic_fraction=None,
+                    max_aliphatic_fraction=None,
+                    extra_aa_fraction_ranges={"K": (0.9, 1.0)})
+
+    def test_net_repulsion_is_warned_about(self):
+        r = design_flank("KKKKRRRRKKKKRRRR", 20, c_context=BINDER, seed=1,
+                         **self.REPELLED, **FAST)
+        assert r.epsilon_per_residue > 0
+        assert any("net repelled" in w for w in r.warnings)
+
+    def test_negative_selectivity_is_warned_about(self):
+        r = design_flank("KKKKRRRRKKKKRRRR", 20, c_context=BINDER, seed=1,
+                         **self.REPELLED, **FAST)
+        assert any("more attracted to random sequence" in w
+                   for w in r.warnings)
+
+    def test_a_good_design_gets_neither_warning(self):
+        r = design_flank(PATCH, 25, c_context=BINDER, seed=4,
+                         max_iterations=300, num_starting_candidates=120)
+        assert r.epsilon_per_residue < 0
+        assert not any("net repelled" in w or "more attracted to random" in w
+                       for w in r.warnings)
+
+    def test_generic_stickiness_warning_is_reachable(self):
+        """Pinned so the warning cannot be silently disabled."""
+        r = design_flank(PATCH, 30, c_context=BINDER, seed=3,
+                         preset="unconstrained", max_iterations=250,
+                         num_starting_candidates=100)
+        if r.decoy_epsilon_mean < -0.1:
+            assert any("generically sticky" in w for w in r.warnings)
+
+
+class TestSpecificityCalibration:
+    """The binder supplies target specificity; the flank adds avidity. So a
+    modest selectivity margin is expected and must not be flagged as a fault.
+    """
+
+    def test_modest_selectivity_is_not_warned_about(self):
+        """Pinned against the actual warning literals, not a word that appears
+        in none of them."""
+        r = design_flank(PATCH, 25, c_context=BINDER, seed=4,
+                         max_iterations=300, num_starting_candidates=120)
+        assert 0.0 < r.specificity_delta < 0.5, r.specificity_delta
+        assert not any("generically sticky" in w for w in r.warnings)
+        assert not any("more attracted to random sequence" in w
+                       for w in r.warnings)
+
+    def test_generic_stickiness_is_still_warned_about(self):
+        """Attracting everything is a different problem and still matters --
+        and the warning itself must fire, not just the underlying metric."""
+        scores = score_flank("W" * 30, PATCH)
+        assert scores["decoy_epsilon_mean"] < -0.1
+        r = design_flank(PATCH, 30, c_context=BINDER, seed=3,
+                         preset="unconstrained", max_iterations=250,
+                         num_starting_candidates=100)
+        if r.decoy_epsilon_mean < -0.1:
+            assert any("generically sticky" in w for w in r.warnings), r.warnings
+
+    def test_complexity_is_reported(self):
+        r = design_flank(PATCH, 25, c_context=BINDER, seed=4, **FAST)
+        assert 0.0 <= r.complexity <= 1.5

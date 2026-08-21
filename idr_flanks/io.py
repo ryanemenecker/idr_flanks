@@ -135,6 +135,16 @@ _TWO_LETTER_ELEMENTS = frozenset({
 })
 
 
+def _normalise_het_name(resname: str) -> str:
+    """Strip trailing charge notation so MD-style ion names match _SOLVENT.
+
+    Simulation tools write ``NA+``, ``CL-`` and ``MG2+`` where the wwPDB writes
+    ``NA``, ``CL`` and ``MG``; without this they survive as occluders.
+    """
+    n = resname.strip().upper()
+    return n.rstrip("+-0123456789") or n
+
+
 def _element_from_pdb_columns(field: str) -> str:
     """Infer an element from the raw 4-character PDB atom-name field.
 
@@ -181,6 +191,12 @@ def _element_from_name(name: str) -> str:
     known = _PROTEIN_ATOM_ELEMENTS.get(n)
     if known is not None:
         return known
+    # Inside an amino acid every name beginning with H or D is a hydrogen:
+    # "HG" is the cysteine/serine gamma hydrogen, not mercury, and "HG11" is a
+    # valine gamma hydrogen. Free metal ions are not amino acids, so they never
+    # reach this function.
+    if n[0] in ("H", "D"):
+        return n[0]
     # Strip a leading digit from hydrogen-style names.
     if n[0].isdigit():
         return n[1].upper() if len(n) > 1 and n[1].isalpha() else ""
@@ -289,11 +305,15 @@ class Residue:
 class Chain:
     """An ordered collection of residues sharing an author chain identifier."""
 
-    __slots__ = ("chain_id", "residues", "_coords_cache")
+    __slots__ = ("chain_id", "residues", "full_sequence", "_coords_cache")
 
     def __init__(self, chain_id: str):
         self.chain_id = chain_id
         self.residues: List[Residue] = []
+        self.full_sequence: str = ""
+        """The complete chain as deposited (from SEQRES or ``_entity_poly``),
+        including residues that were never resolved. Empty when the file does
+        not declare it."""
         self._coords_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     @property
@@ -341,6 +361,37 @@ class Chain:
             if nxt.seq_id - prev.seq_id > 1:
                 out.append((prev.seq_id, nxt.seq_id))
         return out
+
+    def unresolved_termini(self, probe: int = 6) -> Tuple[int, int]:
+        """Residues missing from the N- and C-terminus, as ``(n_missing, c_missing)``.
+
+        Requires :attr:`full_sequence`; returns ``(0, 0)`` when the file does
+        not declare one. Terminal truncation is invisible to
+        :meth:`chain_breaks`, which can only compare residues that are present,
+        yet it is the common case: both chains of PDB 1YCR are truncated at both
+        ends, and the terminus is exactly where a flank gets attached.
+
+        Parameters
+        ----------
+        probe : int
+            How many resolved residues to match when locating the resolved
+            stretch inside the full sequence.
+
+        Returns
+        -------
+        (int, int)
+        """
+        full = self.full_sequence
+        resolved = self.sequence
+        if not full or not resolved:
+            return (0, 0)
+        head = resolved[:probe]
+        tail = resolved[-probe:]
+        start = full.find(head)
+        end = full.rfind(tail)
+        if start < 0 or end < 0:
+            return (0, 0)
+        return (start, len(full) - (end + len(tail)))
 
     def chain_breaks(self, peptide_bond_max: float = 2.0,
                      ca_max: float = 4.5) -> List[Tuple[int, int]]:
@@ -502,14 +553,26 @@ class _Builder:
         self._index: Dict[Tuple[str, int, str], Residue] = {}
         # (chain_id, seq_id, ins_code, atom_name) -> Atom, for altloc contests
         self._atom_index: Dict[Tuple[str, int, str, str], Atom] = {}
+        # residue keys already counted in skipped_residues
+        self._skipped_seen: set = set()
+        # residue positions with two different residue names, and positions
+        # whose numbering appears to collide
+        self._microhet: set = set()
+        self._collisions: set = set()
 
     def note_skipped(self, resname: str,
                      xyz: Optional[np.ndarray] = None,
-                     element: str = "") -> None:
-        if resname in _SOLVENT:
+                     element: str = "",
+                     residue_key: Optional[tuple] = None) -> None:
+        if _normalise_het_name(resname) in _SOLVENT:
             return
-        self.struct.skipped_residues[resname] = \
-            self.struct.skipped_residues.get(resname, 0) + 1
+        # Count residues, not atoms: the field is named and displayed as a
+        # residue count, so one haem must not read as 43.
+        key = (resname,) if residue_key is None else residue_key
+        if key not in self._skipped_seen:
+            self._skipped_seen.add(key)
+            self.struct.skipped_residues[resname] = \
+                self.struct.skipped_residues.get(resname, 0) + 1
         # Keep the coordinates: these atoms still block solvent even though
         # they are not part of a polypeptide chain.
         if xyz is not None and element not in ("H", "D"):
@@ -536,7 +599,14 @@ class _Builder:
         # position. Keep whichever name arrived first and ignore atoms of the
         # other, rather than splicing them into one chimeric residue.
         if resname != res.resname:
+            self._microhet.add((chain_id, seq_id, ins_code))
             return
+
+        # A residue whose atoms have all been seen already means the numbering
+        # collides -- a chain whose numbering restarts, say. Silently folding
+        # the second copy into the first drops its atoms, so record it.
+        if atom_name in {a.name for a in res.atoms} and altloc == "":
+            self._collisions.add((chain_id, seq_id, ins_code))
 
         akey = (chain_id, seq_id, ins_code, atom_name)
         existing = self._atom_index.get(akey)
@@ -576,30 +646,36 @@ class _Builder:
             # into numbering order when file order is not already sorted.
             keys = [(r.seq_id, r.ins_code.strip()) for r in chain.residues]
             if keys != sorted(keys):
-                # Only reorder when the residue identities are unique, so
-                # sorting is unambiguous. A chain that legitimately reuses
-                # numbers (a chimera, or two spliced constructs) is left in
-                # file order and reported instead of being scrambled.
-                if len(set(keys)) == len(keys):
-                    chain.residues = sorted(
-                        chain.residues,
-                        key=lambda r: (r.seq_id, r.ins_code.strip()))
-                    self.struct.warnings.append(
-                        f"chain {cid!r}: residues were not in numbering order "
-                        f"in the file (usually HETATM records written after "
-                        f"ATOM records); reordered by residue number."
-                    )
-                else:
-                    self.struct.warnings.append(
-                        f"chain {cid!r}: residue numbering is out of order and "
-                        f"contains repeated residue identities, so the file "
-                        f"order was kept as-is. Check the sequence is what you "
-                        f"expect."
-                    )
+                # Residue keys are unique by construction (they are the
+                # dict keys used to group atoms), so sorting is unambiguous.
+                chain.residues = sorted(
+                    chain.residues,
+                    key=lambda r: (r.seq_id, r.ins_code.strip()))
+                self.struct.warnings.append(
+                    f"chain {cid!r}: residues were not in numbering order in "
+                    f"the file (usually HETATM records written after ATOM "
+                    f"records); reordered by residue number."
+                )
 
             for i, r in enumerate(chain.residues):
                 r.index = i
             chain._coords_cache = None
+
+        if self._microhet:
+            self.struct.warnings.append(
+                f"{len(self._microhet)} residue position(s) carry more than one "
+                f"residue name (microheterogeneity); the first name seen was "
+                f"kept and the alternatives dropped: "
+                + ", ".join(f"{c}:{s}{i.strip()}"
+                            for c, s, i in sorted(self._microhet)[:5]))
+        if self._collisions:
+            self.struct.warnings.append(
+                f"{len(self._collisions)} residue position(s) appear more than "
+                f"once with the same identity, so numbering collides and the "
+                f"later atoms were discarded: "
+                + ", ".join(f"{c}:{s}{i.strip()}"
+                            for c, s, i in sorted(self._collisions)[:5])
+                + ". Check the chain numbering.")
         return self.struct
 
 
@@ -640,10 +716,19 @@ def read_pdb(path: str, model: Optional[int] = None,
     seen_model_record = False
     found_wanted = False
     n_atom_records = 0
+    seqres: Dict[str, List[str]] = {}
 
     with _open_text(path) as fh:
         for line in fh:
             rec = line[:6]
+            if rec == "SEQRES":
+                # SEQRES gives the chain as deposited, including residues that
+                # were never resolved. Columns: 12 chain id, 20-70 residue
+                # names in four-character fields.
+                cid = line[11] if len(line) > 11 else " "
+                names = line[19:70].split()
+                seqres.setdefault(cid.strip() or " ", []).extend(names)
+                continue
             if rec == "MODEL ":
                 seen_model_record = True
                 try:
@@ -667,7 +752,8 @@ def read_pdb(path: str, model: Optional[int] = None,
             atom_name = line[12:16].strip()
             resname = line[17:20].strip()
             if resname not in THREE_TO_ONE:
-                el = line[76:78].strip().capitalize() if len(line) >= 78 else ""
+                raw = line[76:78].strip() if len(line) >= 78 else ""
+                el = raw.capitalize() if raw.isalpha() else ""
                 if not el:
                     el = _element_from_pdb_columns(line[12:16])
                 try:
@@ -676,10 +762,17 @@ def read_pdb(path: str, model: Optional[int] = None,
                          float(line[46:54])), dtype=np.float64)
                 except ValueError:
                     het_xyz = None
-                builder.note_skipped(resname, het_xyz, el)
+                builder.note_skipped(
+                    resname, het_xyz, el,
+                    residue_key=(resname, line[21], line[22:27]))
                 continue
 
-            element = line[76:78].strip().capitalize() if len(line) >= 78 else ""
+            # Columns 77-78 are optional and legacy writers put charges or
+            # other junk there. Believe them only if they look like an element
+            # symbol; otherwise a hydrogen named "HB1" is kept as a heavy atom
+            # of element "1".
+            raw_element = line[76:78].strip() if len(line) >= 78 else ""
+            element = raw_element.capitalize() if raw_element.isalpha() else ""
             if not element:
                 element = _element_from_pdb_columns(line[12:16])
             if element in ("H", "D"):
@@ -734,6 +827,11 @@ def read_pdb(path: str, model: Optional[int] = None,
 
     struct = builder.finish()
     struct.model = wanted
+    for cid, names in seqres.items():
+        chain = struct.chains.get(cid)
+        if chain is not None:
+            chain.full_sequence = "".join(
+                THREE_TO_ONE.get(n.upper(), "X") for n in names)
     if not struct.chains:
         if n_atom_records == 0:
             raise StructureParseError(
@@ -913,6 +1011,82 @@ def _iter_atom_site_rows(fh: Iterable[str]) -> Iterator[Tuple[Dict[str, int], Li
         return
 
 
+def _cif_entity_poly(path: str) -> Dict[str, str]:
+    """Full deposited sequences per author chain, from ``_entity_poly``.
+
+    Returns ``{chain_id: one_letter_sequence}``. Empty when the file omits the
+    category. Read in a separate pass because ``_entity_poly`` precedes
+    ``_atom_site`` and the atom-site reader stops as soon as it is done.
+    """
+    out: Dict[str, str] = {}
+    with _open_text(path) as fh:
+        stream = _cif_token_stream(fh)
+        pending: Optional[Tuple[str, bool]] = None
+
+        def nxt():
+            nonlocal pending
+            if pending is not None:
+                t, pending = pending, None
+                return t
+            return next(stream, None)
+
+        while True:
+            tok = nxt()
+            if tok is None:
+                break
+            name, blk = tok
+            # Single-entity files use the item form rather than a loop.
+            if not blk and name == "_entity_poly.pdbx_seq_one_letter_code_can":
+                value = nxt()
+                strand = None
+                for _ in range(40):
+                    t = nxt()
+                    if t is None:
+                        break
+                    if not t[1] and t[0] == "_entity_poly.pdbx_strand_id":
+                        strand = nxt()
+                        break
+                if value is not None and strand is not None:
+                    seq = "".join(value[0].split())
+                    for cid in strand[0].replace(",", " ").split():
+                        out[cid] = seq
+                continue
+            if blk or name.lower() != "loop_":
+                continue
+            tags: List[str] = []
+            first: Optional[Tuple[str, bool]] = None
+            while True:
+                t = nxt()
+                if t is None:
+                    break
+                if _cif_is_tag(*t):
+                    tags.append(t[0])
+                else:
+                    first = t
+                    break
+            if not tags or not tags[0].startswith("_entity_poly."):
+                pending = first
+                continue
+            col = {t[len("_entity_poly."):]: i for i, t in enumerate(tags)}
+            if "pdbx_seq_one_letter_code_can" not in col or \
+                    "pdbx_strand_id" not in col:
+                continue
+            width = len(tags)
+            row: List[str] = []
+            t = first
+            while t is not None and not _cif_is_terminator(*t):
+                row.append(t[0])
+                if len(row) == width:
+                    seq = "".join(row[col["pdbx_seq_one_letter_code_can"]].split())
+                    strands = row[col["pdbx_strand_id"]]
+                    for cid in strands.replace(",", " ").split():
+                        out[cid] = seq
+                    row = []
+                t = nxt()
+            break
+    return out
+
+
 def read_cif(path: str, model: Optional[int] = None,
              keep_altloc: str = "occupancy",
              prefer_auth: bool = True) -> Structure:
@@ -946,7 +1120,7 @@ def read_cif(path: str, model: Optional[int] = None,
     n_used = 0
     fallback_seq = 0
     fallback_seen: set = set()
-    fallback_resname: Optional[Tuple[str, str]] = None
+    fallback_resname: Optional[str] = None
     models_seen: set = set()
 
     with _open_text(path) as fh:
@@ -980,7 +1154,13 @@ def read_cif(path: str, model: Optional[int] = None,
                 resname = get("label_comp_id")
             resname = resname.strip().upper()
             if resname not in THREE_TO_ONE:
-                el = get("type_symbol").strip().capitalize()
+                raw = get("type_symbol").strip()
+                el = raw.capitalize() if raw.isalpha() else ""
+                if not el:
+                    # Infer, so a ligand hydrogen is not retained as a
+                    # carbon-sized occluder.
+                    het_name = (get("auth_atom_id") or get("label_atom_id"))
+                    el = _element_from_name(het_name.strip().strip('"').strip("'"))
                 try:
                     het_xyz = np.array((float(row[col["Cartn_x"]]),
                                         float(row[col["Cartn_y"]]),
@@ -988,7 +1168,9 @@ def read_cif(path: str, model: Optional[int] = None,
                                        dtype=np.float64)
                 except (ValueError, KeyError, IndexError):
                     het_xyz = None
-                builder.note_skipped(resname, het_xyz, el)
+                builder.note_skipped(
+                    resname, het_xyz, el,
+                    residue_key=(resname, chain_id, seq_txt, ins_code))
                 continue
 
             atom_name = ""
@@ -998,7 +1180,8 @@ def read_cif(path: str, model: Optional[int] = None,
                 atom_name = get("label_atom_id")
             atom_name = atom_name.strip().strip('"').strip("'")
 
-            element = get("type_symbol").strip().capitalize()
+            raw_element = get("type_symbol").strip()
+            element = raw_element.capitalize() if raw_element.isalpha() else ""
             if not element:
                 element = _element_from_name(atom_name)
             if element in ("H", "D"):
@@ -1036,12 +1219,15 @@ def read_cif(path: str, model: Optional[int] = None,
                 # per-row counter would turn every atom into its own residue.
                 # A new residue is signalled by the residue name changing or by
                 # an atom name repeating within the current one.
-                if (resname, altloc) != fallback_resname or \
-                        atom_name in fallback_seen:
+                # Identity must not include altloc: the standard
+                # sidechain-only alternate-conformation pattern would otherwise
+                # split one residue into several and corrupt the sequence.
+                if (resname != fallback_resname
+                        or (atom_name, altloc) in fallback_seen):
                     fallback_seq += 1
                     fallback_seen = set()
-                    fallback_resname = (resname, altloc)
-                fallback_seen.add(atom_name)
+                    fallback_resname = resname
+                fallback_seen.add((atom_name, altloc))
                 seq_id = fallback_seq
 
             try:
@@ -1074,6 +1260,13 @@ def read_cif(path: str, model: Optional[int] = None,
         )
     builder.struct.model = wanted_model
     struct = builder.finish()
+    try:
+        for cid, seq in _cif_entity_poly(path).items():
+            chain = struct.chains.get(cid)
+            if chain is not None:
+                chain.full_sequence = seq
+    except Exception:  # pragma: no cover - header parsing must never be fatal
+        pass
     if not struct.chains:
         raise StructureParseError(
             f"{path}: parsed {n_rows} _atom_site row(s) but found no amino-acid "

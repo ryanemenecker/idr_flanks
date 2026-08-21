@@ -57,11 +57,18 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="keep buried target residues too (not advised)")
         p.add_argument("--max-residues", type=int, default=None,
                        help="keep only this many residues, nearest first")
+        p.add_argument("--trust-distal-occlusion", action="store_true",
+                       help="let sequence-distant target regions occlude "
+                            "solvent (appropriate for experimental, not "
+                            "predicted, structures)")
 
     contacts.add_argument("-n", "--n-flank", type=int, default=0,
                           help="length of a hypothetical N-terminal flank")
     contacts.add_argument("-c", "--c-flank", type=int, default=0,
                           help="length of a hypothetical C-terminal flank")
+    contacts.add_argument("--linker", type=int, default=0, metavar="N",
+                          help="assume an N-residue linker, which lengthens "
+                               "the tether and so widens the reach")
 
     design.add_argument("-n", "--n-flank", type=int, default=0,
                         help="residues to add at the binder N-terminus")
@@ -82,6 +89,13 @@ def _build_parser() -> argparse.ArgumentParser:
                              "possible'")
     design.add_argument("--max-aromatic", type=float, default=None,
                         help="ceiling on the W+F+Y fraction")
+    design.add_argument("--linker", type=int, default=0, metavar="N",
+                        help="insert an N-residue GS linker between each flank "
+                             "and the binder")
+    design.add_argument("--min-target-preference", type=float, default=None,
+                        help="how much more the flank must prefer the target "
+                             "over the binder's own interface, per residue "
+                             "(default 0.05; 0 disables)")
     design.add_argument("--fasta", metavar="PATH", default=None,
                         help="also write the final sequence as FASTA")
     design.add_argument("--quiet", action="store_true",
@@ -99,6 +113,7 @@ def _interface_kwargs(args: argparse.Namespace) -> dict:
         "surface_threshold": args.surface_threshold,
         "require_surface": not args.no_surface_filter,
         "max_residues": args.max_residues,
+        "trust_distal_occlusion": args.trust_distal_occlusion,
     }
 
 
@@ -129,7 +144,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 region = find_proximal_region(
                     struct, binder_chain=args.binder,
                     target_chain=args.target, terminus=term,
-                    flank_length=length, **_interface_kwargs(args))
+                    flank_length=length + args.linker,
+                    **_interface_kwargs(args))
                 print(region.summary())
                 print()
             return 0
@@ -148,6 +164,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 overrides["target_epsilon_per_residue"] = args.target_epsilon
             if args.max_aromatic is not None:
                 overrides["max_aromatic_fraction"] = args.max_aromatic
+            if args.min_target_preference is not None:
+                overrides["min_target_preference"] = (
+                    None if args.min_target_preference == 0
+                    else args.min_target_preference)
 
             result = build_flanked_binder(
                 args.structure,
@@ -157,12 +177,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 c_flank_length=args.c_flank,
                 model=args.model,
                 preset=args.preset,
+                linker_length=args.linker,
                 patch_weighting=args.patch_weighting,
                 interface_options=_interface_kwargs(args),
                 **overrides,
             )
             if args.quiet:
                 print(result.final_sequence)
+                # Warnings still go to stderr: a scripted caller must not be
+                # handed a construct that is missing binder residues, or that
+                # competes with the target, with no indication anywhere.
+                for warning in result.warnings:
+                    print(f"warning: {warning}", file=sys.stderr)
             else:
                 print(result.summary())
             if args.fasta:

@@ -15,11 +15,17 @@ __all__ = ["FlankedBinder", "build_flanked_binder", "describe_chains"]
 
 # Keyword arguments understood by find_proximal_region, so callers can pass
 # them through build_flanked_binder without a second nested dict.
-_INTERFACE_KEYS = frozenset({
-    "contact_cutoff", "anchor_residues", "radius", "radius_scale",
-    "max_radius", "cluster_gap", "min_cluster_contacts", "sequence_window",
-    "max_residues", "require_surface", "surface_threshold", "sasa_points",
-})
+# Derived from find_proximal_region's own signature rather than hand-listed, so
+# a parameter added there is routed automatically instead of being rejected as
+# an unknown design option.
+def _interface_keys() -> frozenset:
+    import inspect
+    params = set(inspect.signature(find_proximal_region).parameters)
+    return frozenset(params - {"structure", "binder_chain", "target_chain",
+                               "terminus", "flank_length"})
+
+
+_INTERFACE_KEYS = _interface_keys()
 
 
 @dataclass
@@ -32,6 +38,12 @@ class FlankedBinder:
     target_chain: str
     n_flank: str = ""
     c_flank: str = ""
+    linker: str = ""
+    """Flexible linker inserted between each flank and the binder, if any."""
+    binder_full_sequence: str = ""
+    """The binder chain as deposited, including unresolved residues. Splice the
+    designed flank onto this rather than onto :attr:`binder_sequence` when the
+    two differ."""
     regions: Dict[str, ProximalRegion] = field(default_factory=dict)
     designs: Dict[str, DesignResult] = field(default_factory=dict)
     structure: Optional[Structure] = None
@@ -47,23 +59,37 @@ class FlankedBinder:
 
     @property
     def added_residues(self) -> int:
-        return len(self.n_flank) + len(self.c_flank)
+        n_linkers = bool(self.n_flank) + bool(self.c_flank)
+        return len(self.n_flank) + len(self.c_flank) + n_linkers * len(self.linker)
 
     @property
     def warnings(self) -> List[str]:
+        """Everything worth surfacing, from all three stages.
+
+        Region notes are included: without them ``--quiet`` and every
+        programmatic caller would be blind to the whole interface stage,
+        including the small-patch and unresolved-target-break notices.
+        """
         out: List[str] = list(self.structure_warnings)
+        for term, region in self.regions.items():
+            for note in region.notes:
+                out.append(f"{term}-terminal region: {note}")
         for term, design in self.designs.items():
             for w in design.warnings:
                 out.append(f"{term}-terminal flank: {w}")
         return out
 
     def annotated_sequence(self) -> str:
-        """Final sequence with the flanks bracketed, for eyeballing."""
+        """Final sequence with flanks bracketed and linkers in parentheses."""
         parts = []
         if self.n_flank:
             parts.append(f"[{self.n_flank}]")
+            if self.linker:
+                parts.append(f"({self.linker})")
         parts.append(self.binder_sequence)
         if self.c_flank:
+            if self.linker:
+                parts.append(f"({self.linker})")
             parts.append(f"[{self.c_flank}]")
         return "".join(parts)
 
@@ -71,7 +97,8 @@ class FlankedBinder:
         """The final sequence as a FASTA record."""
         header = (f">{name} binder_chain={self.binder_chain} "
                   f"target_chain={self.target_chain} "
-                  f"n_flank={len(self.n_flank)} c_flank={len(self.c_flank)}")
+                  f"n_flank={len(self.n_flank)} c_flank={len(self.c_flank)}"
+                  + (f" linker={self.linker}" if self.linker else ""))
         body = "\n".join(self.final_sequence[i:i + width]
                          for i in range(0, len(self.final_sequence), width))
         return f"{header}\n{body}"
@@ -82,7 +109,11 @@ class FlankedBinder:
             f"Flanked binder: chain {self.binder_chain!r} extended against "
             f"target chain {self.target_chain!r}",
             "=" * 72,
-            f"original binder ({len(self.binder_sequence)} aa):",
+            f"original binder ({len(self.binder_sequence)} aa resolved"
+            + (f", {len(self.binder_full_sequence)} aa deposited)"
+               if self.binder_full_sequence
+               and len(self.binder_full_sequence) != len(self.binder_sequence)
+               else ")"),
             f"  {self.binder_sequence}",
         ]
         for w in self.structure_warnings:
@@ -132,6 +163,8 @@ def build_flanked_binder(
     *,
     n_flank_length: int = 0,
     c_flank_length: int = 0,
+    linker_length: int = 0,
+    linker_sequence: Optional[str] = None,
     model: Optional[int] = None,
     preset: Optional[str] = None,
     config: Optional[DesignConfig] = None,
@@ -151,6 +184,15 @@ def build_flanked_binder(
         Author chain id of the target.
     n_flank_length, c_flank_length : int
         Residues to add at each terminus. At least one must be positive.
+    linker_length : int
+        Length of a flexible linker inserted between each flank and the binder.
+        A designed flank is chemically loaded on purpose, and placing it hard
+        against the binder risks perturbing how the binder folds; a short
+        GS linker buys separation. The linker also lengthens the tether, so the
+        reach used to pick target residues accounts for it.
+    linker_sequence : str, optional
+        Explicit linker sequence. Defaults to a ``GS`` repeat trimmed to
+        ``linker_length``. Ignored when ``linker_length`` is 0.
     model : int, optional
         Structure model to read, when the file has several.
     preset : str, optional
@@ -190,6 +232,30 @@ def build_flanked_binder(
         raise ValueError(
             "at least one of n_flank_length or c_flank_length must be "
             "positive -- otherwise there is nothing to design.")
+    if linker_length < 0:
+        raise ValueError(
+            f"linker_length cannot be negative, got {linker_length}")
+
+    if linker_sequence is not None and not linker_length:
+        raise ValueError(
+            "linker_sequence was given but linker_length is 0, so no linker "
+            "would be inserted. Set linker_length to len(linker_sequence).")
+    if linker_length:
+        if linker_sequence is None:
+            linker = ("GS" * (linker_length // 2 + 1))[:linker_length]
+        else:
+            linker = str(linker_sequence).strip().upper()
+            if len(linker) != linker_length:
+                raise ValueError(
+                    f"linker_sequence has length {len(linker)} but "
+                    f"linker_length is {linker_length}; give one or the other.")
+            unknown = sorted(set(linker) - set("ACDEFGHIKLMNPQRSTVWY"))
+            if unknown:
+                raise ValueError(
+                    f"linker_sequence contains non-amino-acid character(s): "
+                    f"{unknown}")
+    else:
+        linker = ""
 
     if isinstance(structure, Structure):
         if model is not None:
@@ -242,6 +308,27 @@ def build_flanked_binder(
     # Geometric breaks, not numbering jumps: antibody Kabat numbering skips
     # numbers by convention on a chain that is physically continuous, and
     # warning about those would be wrong every time.
+    # Terminal truncation is invisible to chain_breaks (it can only compare
+    # residues that are present) yet it is the common case, and the terminus is
+    # exactly where the flank attaches. Both chains of 1YCR are truncated.
+    n_missing, c_missing = binder.unresolved_termini()
+    for term, missing, length in (("N", n_missing, n_flank_length),
+                                  ("C", c_missing, c_flank_length)):
+        if missing and length > 0:
+            structure_warnings.append(
+                f"the {term}-terminus of binder chain {binder_chain!r} is "
+                f"truncated: {missing} residue(s) present in the deposited "
+                f"sequence were not resolved, so the flank would be attached "
+                f"{missing} residue(s) from where you expect and the anchor "
+                f"used for the reach calculation is the wrong atom. Graft the "
+                f"designed flank onto your full-length sequence instead."
+            )
+        elif missing:
+            structure_warnings.append(
+                f"the {term}-terminus of binder chain {binder_chain!r} is "
+                f"truncated by {missing} unresolved residue(s); this does not "
+                f"affect the flank you asked for.")
+
     breaks = binder.chain_breaks()
     if breaks:
         missing = sum(b - a - 1 for a, b in breaks)
@@ -270,15 +357,21 @@ def build_flanked_binder(
             binder_chain=binder_chain,
             target_chain=target_chain,
             terminus=term,
-            flank_length=length,
+            # The linker is part of the tether, so it extends how far the flank
+            # can reach from the attachment point.
+            flank_length=length + linker_length,
             **iface_kwargs,
         )
         regions[term] = region
 
+        # Contexts describe the finished construct, since predicted disorder
+        # depends on the whole thing.
         if term == "N":
-            n_context, c_context = "", binder_seq + c_flank
+            n_context = ""
+            c_context = linker + binder_seq + (linker + c_flank if c_flank else "")
         else:
-            n_context, c_context = n_flank + binder_seq, ""
+            n_context = ((n_flank + linker) if n_flank else "") + binder_seq + linker
+            c_context = ""
 
         result = design_flank(
             region.weighted_patch_sequence(patch_weighting),
@@ -286,6 +379,7 @@ def build_flanked_binder(
             n_context=n_context,
             c_context=c_context,
             selected_patch=region.patch_sequence,
+            binder_interface=region.binder_interface_sequence,
             preset=preset,
             config=config,
             **design_overrides,
@@ -296,10 +390,16 @@ def build_flanked_binder(
         else:
             c_flank = result.sequence
 
+    final = ((n_flank + linker if n_flank else "")
+             + binder_seq
+             + (linker + c_flank if c_flank else ""))
+
     return FlankedBinder(
         structure_warnings=structure_warnings,
         binder_sequence=binder_seq,
-        final_sequence=n_flank + binder_seq + c_flank,
+        binder_full_sequence=binder.full_sequence,
+        linker=linker,
+        final_sequence=final,
         binder_chain=binder_chain,
         target_chain=target_chain,
         n_flank=n_flank,
