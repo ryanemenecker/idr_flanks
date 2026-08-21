@@ -1,36 +1,20 @@
-# Sample Package Data
+# Package data
 
-This directory contains sample additional data you may want to include with your package.
-This is a place where non-code related additional information (such as data files, molecular structures,  etc.) can 
-go that you want to ship alongside your code.
+## `structures/`
 
-Please note that it is not recommended to place large files in your git directory. If your project requires files larger
-than a few megabytes in size it is recommended to host these files elsewhere. This is especially true for binary files
-as the `git` structure is unable to correctly take updates to these files and will store a complete copy of every version
-in your `git` history which can quickly add up. As a note most `git` hosting services like GitHub have a 1 GB per repository
-cap.
+Small structure files shipped for tests, examples, and documentation.
 
-## Including package data
+| File | Description |
+| --- | --- |
+| `1ycr.pdb` | PDB 1YCR, trimmed to polymer atoms of chains A and B. Chain A is MDM2 (residues 25-109); chain B is the p53 transactivation-domain peptide (residues 17-29). The canonical binder/target test case: chain B is the binder, chain A the target. |
+| `1ycr.cif` | The same entry in mmCIF format, retaining the `_atom_site` loop plus a preceding unrelated loop so the reader's loop handling is exercised. |
 
-Modify your package's `pyproject.toml` file.
-Update the [tool.setuptools.package_data](https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data)
-and point it at the correct files.
-Paths are relative to `package_dir`.
+Both files parse to identical chains and sequences, which is asserted in the
+test suite.
 
-Package data can be accessed at run time with `importlib.resources` or the `importlib_resources` back port.
-See https://setuptools.pypa.io/en/latest/userguide/datafiles.html#accessing-data-files-at-runtime
-for suggestions.
+Access them from code with:
 
-If modules within your package will access internal data files using
-[the recommended approach](https://setuptools.pypa.io/en/latest/userguide/datafiles.html#accessing-data-files-at-runtime),
-you may need to include `importlib_resources` in your package dependencies.
-In `pyproject.toml`, include the following in your `[project]` table.
+```python
+from idr_flanks.data import structure_path
+path = structure_path("1ycr.pdb")
 ```
-dependencies = [
-    "importlib-resources;python_version<'3.10'",
-]
-```
-
-## Manifest
-
-* `look_and_say.dat`: first entries of the "Look and Say" integer series, sequence [A005150](https://oeis.org/A005150)

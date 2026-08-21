@@ -29,9 +29,22 @@ requires-python = ">=3.8"
 #"Source" = "https://github.com/<username>/idr_flanks/"
 #"Documentation" = "https://idr_flanks.readthedocs.io/"
 
+dependencies = [
+    "numpy",
+    "scipy",
+    "goose @ git+https://github.com/idptools/goose.git",
+    "finches @ git+https://github.com/idptools/finches.git",
+    "sparrow @ git+https://github.com/idptools/sparrow.git",
+    "metapredict",
+]
+
+[project.scripts]
+idr-flanks = "idr_flanks.cli:main"
+
 [project.optional-dependencies]
 test = [
   "pytest>=6.1.2",
+  "mdtraj",
 ]
 
 [tool.setuptools]
@@ -62,7 +75,9 @@ where = ["."]
 # Ref https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
 [tool.setuptools.package-data]
 idr_flanks = [
-    "py.typed"
+    "py.typed",
+    "data/structures/*.pdb",
+    "data/structures/*.cif",
 ]
 
 [tool.versioningit]

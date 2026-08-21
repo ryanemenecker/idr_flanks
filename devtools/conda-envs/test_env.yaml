@@ -1,18 +1,30 @@
 name: test
 channels:
-
-  - defaults
+  - conda-forge
 dependencies:
     # Base depends
   - python
   - pip
+
+    # Runtime depends available from conda-forge
+  - numpy
+  - scipy
+  - cython
 
     # Testing
   - pytest
   - pytest-cov
   - codecov
 
-    # Pip-only installs
-  #- pip:
-  #  - codecov
+    # mdtraj is only used by the test that cross-checks our SASA against a
+    # reference implementation; the test skips if it is absent.
+  - mdtraj
 
+    # The idptools stack is not on conda-forge, so it comes from git. GOOSE,
+    # FINCHES and metapredict are only needed for the design tests, which skip
+    # when GOOSE cannot be imported.
+  - pip:
+      - git+https://github.com/idptools/sparrow.git
+      - git+https://github.com/idptools/finches.git
+      - git+https://github.com/idptools/goose.git
+      - metapredict
