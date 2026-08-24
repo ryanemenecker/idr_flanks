@@ -459,6 +459,79 @@ class TestWarnings:
         assert not any("aggregate" in w for w in r.warnings)
 
 
+class TestShellWeightedObjective:
+    """Aiming the objective at reachable surface rather than the flat patch."""
+
+    def _shells(self):
+        from idr_flanks.data import structure_path
+        from idr_flanks.interface import find_proximal_region
+        from idr_flanks.io import read_structure
+        s = read_structure(structure_path("1ycr.pdb"))
+        return find_proximal_region(s, "B", "A", "C", 25), s["B"].sequence
+
+    def test_helper_matches_a_manual_weighted_average(self):
+        from idr_flanks.design import shell_weighted_epsilon
+        model = load_epsilon_model("mpipi")
+        shells = [("KKRR", 3.0), ("DDEE", 1.0)]
+        seq = "DDEEDDEEDDEEDDEE"
+        expected = ((3.0 * model.epsilon(seq, "KKRR")
+                     + 1.0 * model.epsilon(seq, "DDEE")) / 4.0) / len(seq)
+        assert shell_weighted_epsilon(seq, shells) == pytest.approx(expected)
+
+    def test_rejects_zero_weight(self):
+        from idr_flanks.design import shell_weighted_epsilon
+        with pytest.raises(ValueError):
+            shell_weighted_epsilon("DDEE", [("KKRR", 0.0)])
+
+    def test_property_computes_the_weighted_mean(self):
+        from sparrow import Protein
+        from idr_flanks.design import shell_epsilon_class
+        model = load_epsilon_model("mpipi")
+        shells = [("KKRR", 3.0), ("DDEE", 1.0)]
+        prop = shell_epsilon_class()(shells=shells, model=model,
+                                     target_value=-100.0)
+        seq = "DDEEDDEEDDEEDDEE"
+        expected = (3.0 * model.epsilon(seq, "KKRR")
+                    + 1.0 * model.epsilon(seq, "DDEE")) / 4.0
+        assert prop.calculate_raw_value(Protein(seq)) == pytest.approx(expected)
+
+    def test_property_rejects_empty_shells(self):
+        from idr_flanks.design import shell_epsilon_class
+        with pytest.raises(ValueError):
+            shell_epsilon_class()(shells=[], model=load_epsilon_model("mpipi"))
+
+    def test_design_reports_the_weighted_numbers(self):
+        region, binder = self._shells()
+        r = design_flank(region.patch_sequence, 25, n_context=binder,
+                         shells=region.weighted_shells(), seed=7,
+                         max_iterations=200, num_starting_candidates=80)
+        assert r.epsilon_weighted == r.epsilon_weighted
+        assert r.epsilon_near_shell == r.epsilon_near_shell
+        assert "reach-weighted epsilon" in r.summary()
+
+    def test_flat_objective_reports_no_weighted_numbers(self):
+        region, binder = self._shells()
+        r = design_flank(region.patch_sequence, 25, n_context=binder,
+                         seed=7, max_iterations=150,
+                         num_starting_candidates=60)
+        assert r.epsilon_weighted != r.epsilon_weighted
+        assert "reach-weighted epsilon" not in r.summary()
+
+    def test_weighting_improves_near_shell_attraction(self):
+        """The trade it exists to make: better on reachable surface."""
+        region, binder = self._shells()
+        shells = region.weighted_shells()
+        common = dict(n_context=binder, seed=7, max_iterations=300,
+                      num_starting_candidates=120)
+        flat = design_flank(region.patch_sequence, 25, **common)
+        weighted = design_flank(region.patch_sequence, 25, shells=shells,
+                                **common)
+        from idr_flanks.design import shell_weighted_epsilon
+        near = [shells[0]]
+        assert (shell_weighted_epsilon(weighted.sequence, near)
+                < shell_weighted_epsilon(flat.sequence, near))
+
+
 class TestBinderCompetition:
     """A flank attracted to the binder's own target-binding surface competes
     with the target for it, so a stronger design can mean weaker net affinity.

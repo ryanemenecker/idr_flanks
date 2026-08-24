@@ -57,6 +57,13 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="keep buried target residues too (not advised)")
         p.add_argument("--max-residues", type=int, default=None,
                        help="keep only this many residues, nearest first")
+        p.add_argument("--exclude-target", metavar="SPEC", default=None,
+                       help="target residues to rule out, in author numbering, "
+                            "e.g. '1-100' or '1-100,250-300'. Use when a "
+                            "predictor has folded a region onto the real "
+                            "binding site.")
+        p.add_argument("--include-target", metavar="SPEC", default=None,
+                       help="consider only these target residues, same format")
         p.add_argument("--trust-distal-occlusion", action="store_true",
                        help="let sequence-distant target regions occlude "
                             "solvent (appropriate for experimental, not "
@@ -89,6 +96,9 @@ def _build_parser() -> argparse.ArgumentParser:
                              "possible'")
     design.add_argument("--max-aromatic", type=float, default=None,
                         help="ceiling on the W+F+Y fraction")
+    design.add_argument("--no-reach-weighting", action="store_true",
+                        help="aim the objective flatly at the whole patch "
+                             "instead of weighting by tethered-chain reach")
     design.add_argument("--linker", type=int, default=0, metavar="N",
                         help="insert an N-residue GS linker between each flank "
                              "and the binder")
@@ -114,6 +124,8 @@ def _interface_kwargs(args: argparse.Namespace) -> dict:
         "require_surface": not args.no_surface_filter,
         "max_residues": args.max_residues,
         "trust_distal_occlusion": args.trust_distal_occlusion,
+        "exclude_target_residues": args.exclude_target,
+        "include_target_residues": args.include_target,
     }
 
 
@@ -178,6 +190,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 model=args.model,
                 preset=args.preset,
                 linker_length=args.linker,
+                reach_weighted=not args.no_reach_weighting,
                 patch_weighting=args.patch_weighting,
                 interface_options=_interface_kwargs(args),
                 **overrides,

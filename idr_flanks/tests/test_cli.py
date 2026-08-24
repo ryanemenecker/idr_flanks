@@ -236,6 +236,45 @@ class TestNewFlags:
         assert default.count("residues selected") == 1
 
 
+class TestTargetSelectionFlags:
+    def test_exclude_target_changes_the_region(self, capsys):
+        def selected(extra):
+            main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25"] + extra)
+            line = next(l for l in capsys.readouterr().out.splitlines()
+                        if "residues selected" in l)
+            return int(line.split(":")[1])
+        assert selected(["--exclude-target", "25-60"]) < selected([])
+
+    def test_exclude_target_is_reported(self, capsys):
+        main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25",
+              "--exclude-target", "25-60"])
+        assert "excluded target residues 25-60" in capsys.readouterr().out
+
+    def test_include_target_restricts(self, capsys):
+        main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25",
+              "--include-target", "61-75"])
+        out = capsys.readouterr().out
+        assert "restricted to target residues" in out
+
+    def test_excluding_everything_is_a_clean_error(self, capsys):
+        code = main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25",
+                     "--exclude-target", "1-1000"])
+        assert code == 1
+        assert "no contact" in capsys.readouterr().err
+
+    def test_malformed_spec_is_a_clean_error(self, capsys):
+        code = main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25",
+                     "--exclude-target", "not-a-range"])
+        assert code == 1
+        assert "error:" in capsys.readouterr().err
+
+    def test_design_accepts_the_flag(self, capsys):
+        code = main(["design", PDB, "-b", "B", "-t", "A", "-c", "12",
+                     "--exclude-target", "25-60", "--seed", "1",
+                     "--iterations", "40", "--quiet"])
+        assert code == 0
+
+
 class TestParser:
     def test_version(self, capsys):
         with pytest.raises(SystemExit) as exc:

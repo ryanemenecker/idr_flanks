@@ -107,6 +107,32 @@ residues to one, while ignoring it keeps all seven. Pass
 ``trust_distal_occlusion=True`` for an experimental structure, where the packing
 is genuine; on 1YCR, which has nothing sequence-distant, it changes nothing.
 
+**Declared eligibility.** ``exclude_target_residues`` and
+``include_target_residues`` let you rule regions in or out by author residue
+number. They exist because the automatic filters have a blind spot: they remove
+*small* spurious patches, but a predictor that folds an entire terminus onto the
+real binding site produces a large, self-consistent patch that looks exactly
+like a genuine second epitope.
+
+Both accept ``"1-100"``, ``"1-100,250-300"``, ``(1, 100)``,
+``[(1, 100), (250, 300)]``, ``[5, 12, 88]`` or ``range(1, 101)``. A bare pair of
+integers is a **range**, so ``[1, 100]`` is the first hundred residues; write
+``"5,12"`` for two individual residues. The parsed selection is echoed in the
+region notes.
+
+The selection is applied *before* the interface is located. That ordering is the
+whole point: filtering only the final selection would leave the mispredicted
+patch free to define an accepted sequence window and admit its neighbours.
+Excluded residues also stop occluding solvent, for the same reason
+``trust_distal_occlusion`` defaults to ``False``.
+
+Measured on a reproduction of the failure -- a basic N-terminal region
+mispredicted onto an acidic C-terminal site -- the unrestricted patch was 67%
+mispredicted region and the design came out acidic and *repelled* from the true
+site (+0.832 per residue). With ``exclude_target_residues=[1, 100]`` it came out
+basic and attracted (-0.757). The only warning beforehand was a note that the
+target presented two interface patches.
+
 **Sequence locality.** Predicted structures place sequence-distant parts of the
 target next to the binder more often than real ones do, and those contacts are
 usually artifacts. So:

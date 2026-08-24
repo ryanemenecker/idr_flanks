@@ -81,6 +81,80 @@ class TestReachIsResidueAveraged:
         assert n != c
 
 
+class TestTetherContactWeights:
+    """The weight is the tethered-chain monomer density at that distance, which
+    decays far faster than the linear taper it replaced."""
+
+    def test_unity_at_the_anchor(self):
+        from idr_flanks.interface import tether_contact_weight
+        assert tether_contact_weight(0.0, 25) == pytest.approx(1.0)
+
+    def test_monotonically_decreasing(self):
+        from idr_flanks.interface import tether_contact_weights
+        w = tether_contact_weights(np.arange(0.0, 40.0, 2.0), 25)
+        assert np.all(np.diff(w) < 0)
+        assert np.all(w > 0)
+
+    def test_decays_faster_than_a_linear_taper(self):
+        """The measured over-weighting the linear taper caused: 2.4x at 10 A."""
+        from idr_flanks.interface import tether_contact_weight
+        r = reach_radius(25)
+        for d, expected_ratio in ((10.0, 2.4), (15.0, 2.9)):
+            linear = max(0.0, 1.0 - d / r)
+            tethered = tether_contact_weight(d, 25)
+            assert linear / tethered == pytest.approx(expected_ratio, abs=0.2)
+
+    def test_longer_flanks_reach_further(self):
+        from idr_flanks.interface import tether_contact_weight
+        assert tether_contact_weight(20.0, 60) > tether_contact_weight(20.0, 15)
+
+    def test_rejects_nonpositive_length(self):
+        from idr_flanks.interface import tether_contact_weights
+        with pytest.raises(ValueError):
+            tether_contact_weights(np.array([1.0]), 0)
+
+    def test_region_weights_use_it(self, ycr):
+        from idr_flanks.interface import tether_contact_weight
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        for p in region:
+            assert p.weight == pytest.approx(
+                tether_contact_weight(p.anchor_distance, 25))
+
+
+class TestWeightedShells:
+    def test_shells_partition_the_patch(self, ycr):
+        """Every selected residue appears in exactly one shell. Shells group by
+        distance, so their concatenation is a permutation of the patch rather
+        than the patch itself."""
+        from collections import Counter
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        shells = region.weighted_shells()
+        assert shells
+        assert all(w > 0 for _, w in shells)
+        joined = "".join(s for s, _ in shells)
+        assert len(joined) == len(region.patch_sequence)
+        assert Counter(joined) == Counter(region.patch_sequence)
+
+    def test_inner_shells_carry_disproportionate_weight(self, ycr):
+        """The point of the exercise: near residues must dominate."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        shells = region.weighted_shells()
+        total_w = sum(w for _, w in shells)
+        total_n = sum(len(s) for s, _ in shells)
+        inner_seq, inner_w = shells[0]
+        # the innermost shell's weight share exceeds its residue-count share
+        assert inner_w / total_w > len(inner_seq) / total_n
+
+    def test_custom_edges(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert len(region.weighted_shells(edges=(8.0,))) <= 2
+
+    def test_empty_shells_are_dropped(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        shells = region.weighted_shells(edges=(0.5, 1.0, 1.5))
+        assert all(s for s, _ in shells)
+
+
 class TestContactMap:
     def test_matches_brute_force(self, ycr):
         a, b = ycr["A"], ycr["B"]
@@ -637,6 +711,183 @@ class TestFormatAgnostic:
         rc = find_proximal_region(cif, "B", "A", "C", 20)
         assert rp.seq_ids == rc.seq_ids
         assert rp.patch_sequence == rc.patch_sequence
+
+
+class TestResidueSpecParsing:
+    """The selection syntax, including the one deliberately ambiguous case."""
+
+    def test_string_range(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse("1-100") == set(range(1, 101))
+
+    def test_string_multiple_ranges(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse("1-10,20-25") == set(range(1, 11)) | set(range(20, 26))
+
+    def test_string_mixed(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse("1-10,50") == set(range(1, 11)) | {50}
+
+    def test_bare_pair_is_a_range(self):
+        """The documented behaviour: [1, 100] means the first hundred."""
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse([1, 100]) == set(range(1, 101))
+        assert parse((1, 100)) == set(range(1, 101))
+
+    def test_three_or_more_are_individual(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse([5, 12, 88]) == {5, 12, 88}
+
+    def test_nested_ranges(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse([(1, 10), (20, 25)]) == set(range(1, 11)) | set(range(20, 26))
+
+    def test_singleton_lists_are_individual(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse([[5], [12]]) == {5, 12}
+
+    def test_range_object_and_int(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse(range(1, 11)) == set(range(1, 11))
+        assert parse(5) == {5}
+
+    def test_none_is_empty(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse(None) == set()
+
+    def test_negative_numbering_supported(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        assert parse("-3--1") == {-3, -2, -1}
+
+    def test_backwards_range_rejected(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        with pytest.raises(ValueError, match="backwards"):
+            parse([(100, 1)])
+
+    def test_garbage_rejected(self):
+        from idr_flanks.interface import parse_residue_spec as parse
+        with pytest.raises(ValueError):
+            parse("not-a-number")
+
+
+class TestTargetResidueSelection:
+    """A predictor that folds a whole terminus onto the real binding site makes
+    a large, self-consistent contact patch that the automatic noise filter
+    cannot distinguish from the genuine one. Only the user knows."""
+
+    @staticmethod
+    def _residue(chain, num, name, x, y, z, serial):
+        out = []
+        for atom, el, dx in (("N", "N", 0.0), ("CA", "C", 1.4),
+                             ("C", "C", 2.4), ("O", "O", 3.0)):
+            out.append(
+                f"ATOM  {serial:5d}  {atom:<3s} {name} {chain}{num:4d}    "
+                f"{x + dx:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          "
+                f"{el:>2s}\n")
+            serial += 1
+        return out, serial
+
+    @pytest.fixture
+    def mispredicted(self, tmp_path):
+        """True site 480-495 (acidic) above the binder; residues 1-100
+        (basic) mispredicted onto the other face, also in contact."""
+        lines, sn = [], 1
+        for i in range(6):
+            block, sn = self._residue("B", i + 1, "GLY", i * 3.8, 0.0, 0.0, sn)
+            lines += block
+        for k, num in enumerate(range(480, 496)):
+            block, sn = self._residue("A", num, "GLU", (k % 8) * 3.8, 4.3,
+                                      (k // 8) * 3.6, sn)
+            lines += block
+        for k, num in enumerate(range(1, 101)):
+            block, sn = self._residue("A", num, "LYS", (k % 8) * 3.8, -4.3,
+                                      (k // 8) * 3.6, sn)
+            lines += block
+        p = tmp_path / "mispredicted.pdb"
+        p.write_text("".join(lines) + "END\n")
+        return read_pdb(str(p))
+
+    def test_the_failure_reproduces_without_help(self, mispredicted):
+        """Both patches survive: the automatic filters cannot fix this."""
+        region = find_proximal_region(mispredicted, "B", "A", "C", 25)
+        assert set("KE") <= set(region.patch_sequence)
+        assert any(a <= 100 for a, _ in region.spans)
+        assert any("2 distinct interface patches" in n for n in region.notes)
+
+    def test_exclusion_removes_the_mispredicted_region(self, mispredicted):
+        region = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                      exclude_target_residues=[1, 100])
+        assert set(region.patch_sequence) == {"E"}
+        assert region.spans == [(480, 495)]
+        assert all(s >= 480 for s in region.seq_ids)
+
+    def test_inclusion_is_equivalent_here(self, mispredicted):
+        excluded = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                        exclude_target_residues="1-100")
+        included = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                        include_target_residues=[480, 495])
+        assert excluded.seq_ids == included.seq_ids
+
+    def test_string_and_list_forms_agree(self, mispredicted):
+        a = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                 exclude_target_residues="1-100")
+        b = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                 exclude_target_residues=[1, 100])
+        assert a.seq_ids == b.seq_ids
+
+    def test_excluded_region_cannot_define_an_interface_patch(self, mispredicted):
+        """The filter must run before clustering, or the excluded patch still
+        opens a sequence window for its neighbours."""
+        region = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                      exclude_target_residues=[1, 100])
+        assert not any("2 distinct interface patches" in n
+                       for n in region.notes)
+
+    def test_selection_is_reported(self, mispredicted):
+        region = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                      exclude_target_residues=[1, 100])
+        assert any("excluded target residues 1-100" in n for n in region.notes)
+        assert any("ruled out by the target-residue selection" in n
+                   for n in region.notes)
+
+    def test_excluding_the_whole_interface_errors_clearly(self, mispredicted):
+        with pytest.raises(InterfaceError, match="no contact"):
+            find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                 exclude_target_residues="1-1000")
+
+    def test_include_selecting_absent_numbers_errors(self, mispredicted):
+        with pytest.raises(InterfaceError, match="contains none"):
+            find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                 include_target_residues=[9000, 9100])
+
+    def test_no_selection_leaves_behaviour_unchanged(self, ycr):
+        plain = find_proximal_region(ycr, "B", "A", "C", 25)
+        explicit = find_proximal_region(ycr, "B", "A", "C", 25,
+                                        exclude_target_residues=None,
+                                        include_target_residues=None)
+        assert plain.seq_ids == explicit.seq_ids
+
+    def test_partial_exclusion_on_a_real_structure(self, ycr):
+        """Excluding part of a real interface.
+
+        The result is not simply a subset of the unrestricted selection, and
+        that is correct: removing 25-60 shifts the accepted interface patch
+        from 50-75 to 61-75, which moves the sequence window, and the excluded
+        residues also stop occluding, so a few formerly buried neighbours
+        become exposed. What is guaranteed is that the exclusion is honoured.
+        """
+        full = find_proximal_region(ycr, "B", "A", "C", 25)
+        trimmed = find_proximal_region(ycr, "B", "A", "C", 25,
+                                       exclude_target_residues="25-60")
+        assert all(not (25 <= s <= 60) for s in trimmed.seq_ids)
+        assert 0 < len(trimmed) < len(full)
+        assert any(25 <= s <= 60 for s in full.seq_ids), (
+            "the range must actually have been in play")
+
+    def test_exclusion_shifts_the_accepted_patch(self, ycr):
+        trimmed = find_proximal_region(ycr, "B", "A", "C", 25,
+                                       exclude_target_residues="25-60")
+        assert any("61-75" in n for n in trimmed.notes)
 
 
 class TestDistalOcclusion:

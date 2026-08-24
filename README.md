@@ -113,6 +113,37 @@ usable residues to one; ignoring it keeps all seven. Pass
 is genuine. On 1YCR, where nothing is sequence-distant, the setting changes
 nothing.
 
+**Your own knowledge of the system.** The automatic filters below remove
+*small* spurious contact patches. They cannot help when a predictor folds a
+whole terminus back onto the real binding site: that produces a large,
+self-consistent patch indistinguishable from the genuine one. Only you know it
+is wrong, so say so:
+
+```python
+result = build_flanked_binder("complex.pdb", binder_chain="B",
+                             target_chain="A", c_flank_length=30,
+                             exclude_target_residues=[1, 100])   # or "1-100"
+```
+
+`include_target_residues` is the complement — consider only those residues.
+Both take author numbering, and accept `"1-100"`, `"1-100,250-300"`,
+`(1, 100)`, `[(1, 100), (250, 300)]`, `[5, 12, 88]`, or `range(1, 101)`. Note
+that a bare pair of integers means a *range*: `[1, 100]` is the first hundred
+residues, not residues 1 and 100. Whatever is parsed is echoed back in the
+region notes.
+
+This applies **before** the interface is located, not just to the final
+selection — otherwise the mispredicted patch would still define an accepted
+sequence window and let its neighbours through. Excluded residues also stop
+occluding, on the same reasoning as `trust_distal_occlusion`.
+
+It matters more than dilution: on a reproduction where a basic N-terminal
+region was mispredicted onto an acidic C-terminal binding site, the unrestricted
+patch was 67% wrong region (32 K against 16 E) and the resulting flank came out
+acidic and **repelled** from the true site (+0.832 per residue). Excluding
+`[1, 100]` flipped it to basic and strongly attracted (−0.757). A sign error,
+silent apart from a "target presents 2 distinct interface patches" note.
+
 **Sequence locality.** These are usually *predicted* structures, and predictors
 routinely place a sequence-distant part of the target next to the binder. The
 real interface is located independently from binder-wide contacts, grouped into
@@ -149,11 +180,52 @@ is never mutated) against:
   actively misleading: a poly-aromatic flank scores 1.00 disordered alone and
   **0.00** once fused to a folded binder. Requiring only the in-context number
   is also gameable, so both are enforced.
+- **Reach weighting** — the objective is a weighted average over distance
+  shells, not a flat average over the whole patch (see below).
 - **A composition envelope** — every residue capped at 3× its frequency in real
   IDRs (from GOOSE's `IDRProbs`, derived from the disordered regions of eleven
   proteomes), plus group caps on W+F+Y and A+I+L+M+V.
 - **Not competing with the target for the binder** — the flank must prefer the
   target patch to the binder's *own* target-binding surface by a margin.
+
+### Reach weighting, and what it did and did not fix
+
+Roughly half the selected residues typically sit beyond 15 Å of the anchor,
+where the tethered-chain monomer density is under a tenth of its contact value —
+yet a flat patch let them contribute in proportion to their count. The residue
+weight is now the tethered-chain monomer density,
+`w(d) = Σᵢ (3/2πRᵢ²)^{3/2} exp(−3d²/2Rᵢ²)` with `Rᵢ = 6.2·i^0.52`, normalised to
+1 at contact. It is derived from the same polymer relation as the reach radius,
+not fitted. The linear taper it replaces over-weighted distant surface by a
+measured 2.4× at 10 Å and 2.9× at 15 Å.
+
+The objective is then a weighted average over distance shells rather than one
+epsilon call against the concatenated patch — weights can only be applied
+*between* epsilon calls, since FINCHES takes a sequence. On 1YCR this improves
+attraction to the innermost shell by about 20% (−0.086 → −0.104 per residue) for
+a ~3% cost in whole-patch epsilon. Disable with `reach_weighted=False`.
+
+**It did not make the designs target-specific, and that is the more important
+result.** A cross-design matrix over six complexes (1YCR C and N, 1DFJ, 3HHR,
+1BRS, 1FCC), scoring every flank against every patch with the same
+reach-weighted metric:
+
+| objective | diagonal wins | mean rank of the correct flank | gap to best rival |
+|---|---|---|---|
+| flat patch | 3 / 6 | 1.83 / 6 | +0.004 (tied) |
+| reach-weighted | 3 / 6 | 1.50 / 6 | −0.004 (marginal) |
+
+So the geometry was *not* the cause of interchangeability. The limit is the
+interaction model: FINCHES epsilon is very nearly a function of composition alone
+(shuffling a patch moves it ≤1.3%), so once the patch's net chemistry is fixed
+the optimal composition is determined and any sequence with that composition
+scores the same. Two designs against different targets came out as distinct
+sequences that scored identically to three decimals.
+
+What the method *does* do is pick the right chemical class: mean epsilon on the
+intended patch is −0.30 versus −0.09 for flanks designed against a different
+class of patch, a 3.3× advantage. Read the package as selecting complementary
+chemistry for a target, not a target-unique sequence.
 
 ### Why the anti-competition guard matters
 
@@ -333,6 +405,11 @@ ones.
   coarse-grained interaction model, and metapredict is a disorder predictor.
   Neither is a binding free energy. These designs are hypotheses to test, not
   validated binders.
+- **Designs are chemistry-class specific, not target specific.** See the
+  cross-design matrix above. Flanks are largely interchangeable among targets
+  presenting the same net chemistry, and reach weighting did not change that.
+  Do not present a design as bespoke to one target without testing it against a
+  same-class control.
 - **Hydrophobic target patches are intrinsically hard.** A hydrophobic patch
   attracts almost everything, so no configuration made a flank against one
   measurably more selective than a random sequence. Charge-complementary patches

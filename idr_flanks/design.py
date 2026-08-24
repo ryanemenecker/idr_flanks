@@ -36,6 +36,8 @@ __all__ = [
     "load_epsilon_model",
     "epsilon_per_residue",
     "target_discriminability",
+    "shell_epsilon_class",
+    "shell_weighted_epsilon",
     "idr_amino_acid_frequencies",
     "context_disorder_class",
     "binder_competition_class",
@@ -315,6 +317,85 @@ def _make_avoidance_class(class_name: str):
     _Avoidance.__name__ = class_name
     _Avoidance.__qualname__ = class_name
     return _Avoidance
+
+
+def _make_shell_epsilon_class():
+    """Build the ShellWeightedEpsilon property against GOOSE's base class."""
+    from goose.backend.optimizer_properties import ConstraintType, CustomProperty
+
+    class ShellWeightedEpsilon(CustomProperty):
+        """Weighted-average epsilon over distance shells of the target patch.
+
+        Raw value is ``sum(w_k * epsilon(flank, shell_k)) / sum(w_k)``, so it
+        keeps the units and length-scaling of a plain epsilon while aiming the
+        objective at the surface the flank actually reaches.
+
+        A flat average over the whole patch is the wrong target: on every
+        system tested roughly half the selected residues sit beyond 15 A of the
+        anchor, where the tethered-chain monomer density is under a tenth of its
+        value at contact, yet they contributed proportional to their count.
+        Weighting cannot be done inside a single epsilon call because FINCHES
+        takes a sequence, so it is done across a few calls instead.
+
+        Parameters
+        ----------
+        shells : sequence of (str, float)
+            ``(sequence, weight)`` per shell, from
+            :meth:`~idr_flanks.interface.ProximalRegion.weighted_shells`.
+        model : object
+            A FINCHES frontend.
+        """
+
+        can_be_linear_profile = False
+        calculate_in_batch = False
+
+        def __init__(self, shells, model, target_value: float = 0.0,
+                     weight: float = 1.0,
+                     constraint_type=ConstraintType.MAXIMUM):
+            self.shells = [(str(s), float(w)) for s, w in shells]
+            total = sum(w for _, w in self.shells)
+            if not self.shells or total <= 0:
+                raise ValueError("shells must be non-empty with positive weight")
+            self._norm = total
+            self._model = model
+            super().__init__(target_value=target_value, weight=weight,
+                             constraint_type=constraint_type)
+
+        def get_init_args(self) -> dict:
+            args = super().get_init_args()
+            args.update({"shells": self.shells, "model": self._model})
+            return args
+
+        def calculate_raw_value(self, protein) -> float:
+            seq = protein.sequence
+            eps = self._model.epsilon
+            return float(sum(w * eps(seq, s) for s, w in self.shells)
+                         / self._norm)
+
+    return ShellWeightedEpsilon
+
+
+_ShellWeightedEpsilon = None
+
+
+def shell_epsilon_class():
+    """The :class:`ShellWeightedEpsilon` class, for ``add_property``."""
+    global _ShellWeightedEpsilon
+    if _ShellWeightedEpsilon is None:
+        _ShellWeightedEpsilon = _make_shell_epsilon_class()
+    return _ShellWeightedEpsilon
+
+
+def shell_weighted_epsilon(sequence: str, shells, model: str = "mpipi") -> float:
+    """Weighted per-residue epsilon of ``sequence`` against distance shells."""
+    if not sequence:
+        raise ValueError("sequence must be non-empty")
+    mf = load_epsilon_model(model)
+    total = sum(w for _, w in shells)
+    if total <= 0:
+        raise ValueError("shell weights must sum to a positive value")
+    return float(sum(w * mf.epsilon(sequence, s) for s, w in shells)
+                 / total) / len(sequence)
 
 
 def _make_competition_class():
@@ -686,6 +767,12 @@ class DesignResult:
     specificity_delta: float = float("nan")
     decoy_epsilon_mean: float = float("nan")
     decoy_epsilon_sd: float = float("nan")
+    epsilon_weighted: float = float("nan")
+    """Reach-weighted epsilon: the average over distance shells that the
+    objective actually optimises when shells are supplied."""
+    epsilon_near_shell: float = float("nan")
+    """Epsilon against the innermost shell only -- the surface the flank is
+    most likely to touch."""
     reference_epsilon_per_residue: float = float("nan")
     reference_epsilon_sd: float = float("nan")
     binder_interface_sequence: str = ""
@@ -723,6 +810,10 @@ class DesignResult:
                and self.selected_patch_sequence != self.patch_sequence else [] ),
             f"  epsilon vs patch       : {self.epsilon_total:.2f} "
             f"({self.epsilon_per_residue:+.3f} per residue; negative is attractive)",
+            *( [f"  reach-weighted epsilon : {self.epsilon_weighted:+.3f} per "
+                f"residue (what the objective optimises); near shell only "
+                f"{self.epsilon_near_shell:+.3f}"]
+               if self.epsilon_weighted == self.epsilon_weighted else [] ),
             f"  neutral reference      : "
             f"{self.reference_epsilon_per_residue:+.3f} per residue"
             + (f" (sd {self.reference_epsilon_sd:.3f})"
@@ -857,6 +948,7 @@ def _neutral_reference(length: int, seed: int = 0) -> str:
 def score_flank(sequence: str, patch_sequence: str,
                 n_context: str = "", c_context: str = "",
                 binder_interface: str = "",
+                shells: Optional[Sequence] = None,
                 model: str = "mpipi",
                 disorder_cutoff: float = 0.5,
                 specificity: bool = True,
@@ -927,6 +1019,16 @@ def score_flank(sequence: str, patch_sequence: str,
         out["epsilon_vs_binder_interface"] = float(
             mf.epsilon(sequence, binder_interface)) / L
 
+    if shells:
+        total = sum(w for _, w in shells)
+        if total > 0:
+            out["epsilon_weighted"] = float(
+                sum(w * mf.epsilon(sequence, s) for s, w in shells)
+                / total) / L
+        # The innermost shell is the surface the flank actually touches.
+        inner = shells[0][0]
+        out["epsilon_near_shell"] = float(mf.epsilon(sequence, inner)) / L
+
     out["aromatic_fraction"] = sum(sequence.count(a) for a in _AROMATICS) / L
     try:
         p = Protein(sequence)
@@ -978,6 +1080,7 @@ def design_flank(patch_sequence: str,
                  c_context: str = "",
                  selected_patch: Optional[str] = None,
                  binder_interface: str = "",
+                 shells: Optional[Sequence] = None,
                  preset: Optional[str] = None,
                  config: Optional[DesignConfig] = None,
                  **overrides: Any) -> DesignResult:
@@ -989,7 +1092,8 @@ def design_flank(patch_sequence: str,
     result = _design_flank_once(patch_sequence, length, n_context=n_context,
                                 c_context=c_context,
                                 selected_patch=selected_patch,
-                                binder_interface=binder_interface, config=cfg)
+                                binder_interface=binder_interface,
+                                shells=shells, config=cfg)
 
     # Retrying only helps if a disorder term is actually in play. Without any
     # sequence context the in-context number equals the isolated one, and a
@@ -1006,7 +1110,7 @@ def design_flank(patch_sequence: str,
                                    c_context=c_context,
                                    selected_patch=selected_patch,
                                    binder_interface=binder_interface,
-                                   config=retry_cfg)
+                                   shells=shells, config=retry_cfg)
         better = (retry if retry.fraction_disorder_in_context
                   > result.fraction_disorder_in_context else result)
         better.warnings.insert(0, (
@@ -1025,6 +1129,7 @@ def _design_flank_once(patch_sequence: str,
                        c_context: str = "",
                        selected_patch: Optional[str] = None,
                        binder_interface: str = "",
+                       shells: Optional[Sequence] = None,
                        preset: Optional[str] = None,
                        config: Optional[DesignConfig] = None,
                        **overrides: Any) -> DesignResult:
@@ -1155,15 +1260,26 @@ def _design_flank_once(patch_sequence: str,
         eps_target = -1000.0 * length
     else:
         eps_target = float(cfg.target_epsilon_per_residue) * length
-    optimizer.add_property(
-        MeanEpsilonWithTarget,
-        target_sequence=patch_sequence,
-        target_value=eps_target,
-        weight=cfg.epsilon_weight,
-        constraint_type="maximum",
-        preloaded_model=model,
-        tolerance=0.1,
-    )
+    if shells:
+        optimizer.add_property(
+            shell_epsilon_class(),
+            shells=shells,
+            model=model,
+            target_value=eps_target,
+            weight=cfg.epsilon_weight,
+            constraint_type="maximum",
+            tolerance=0.1,
+        )
+    else:
+        optimizer.add_property(
+            MeanEpsilonWithTarget,
+            target_sequence=patch_sequence,
+            target_value=eps_target,
+            weight=cfg.epsilon_weight,
+            constraint_type="maximum",
+            preloaded_model=model,
+            tolerance=0.1,
+        )
 
     # --- do not compete with the target for the binder's own interface ---
     # Check first whether the two surfaces can be told apart at all. If they
@@ -1263,6 +1379,7 @@ def _design_flank_once(patch_sequence: str,
     scores = score_flank(sequence, patch_sequence,
                          n_context=n_context, c_context=c_context,
                          binder_interface=binder_interface,
+                         shells=shells,
                          model=cfg.epsilon_model,
                          disorder_cutoff=cfg.disorder_cutoff,
                          seed=0 if cfg.seed is None else cfg.seed)
@@ -1368,6 +1485,8 @@ def _design_flank_once(patch_sequence: str,
         specificity_delta=scores.get("specificity_delta", float("nan")),
         decoy_epsilon_mean=scores.get("decoy_epsilon_mean", float("nan")),
         decoy_epsilon_sd=scores.get("decoy_epsilon_sd", float("nan")),
+        epsilon_weighted=scores.get("epsilon_weighted", float("nan")),
+        epsilon_near_shell=scores.get("epsilon_near_shell", float("nan")),
         reference_epsilon_per_residue=scores["reference_epsilon_per_residue"],
         reference_epsilon_sd=scores.get("reference_epsilon_sd", float("nan")),
         binder_interface_sequence=binder_interface,

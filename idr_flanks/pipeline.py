@@ -169,6 +169,8 @@ def build_flanked_binder(
     preset: Optional[str] = None,
     config: Optional[DesignConfig] = None,
     patch_weighting: int = 1,
+    reach_weighted: bool = True,
+    shell_edges: Sequence[float] = (5.0, 10.0, 15.0),
     interface_options: Optional[Dict[str, Any]] = None,
     **overrides: Any,
 ) -> FlankedBinder:
@@ -199,6 +201,15 @@ def build_flanked_binder(
         Design preset; see :data:`~idr_flanks.design.PRESETS`.
     config : DesignConfig, optional
         Full design configuration instead of a preset.
+    reach_weighted : bool
+        Aim the attraction objective at a weighted average over distance shells
+        rather than flatly at the whole patch. On by default: roughly half the
+        selected residues typically sit beyond 15 A of the anchor, where the
+        tethered-chain monomer density is under a tenth of its contact value,
+        yet a flat patch lets them contribute in proportion to their count.
+        Costs one epsilon call per shell per candidate.
+    shell_edges : sequence of float
+        Distance-shell boundaries in angstroms, used when ``reach_weighted``.
     patch_weighting : int
         Repeat target residues near the attachment point up to this many times,
         so the design preferentially complements the surface the flank is most
@@ -373,9 +384,13 @@ def build_flanked_binder(
             n_context = ((n_flank + linker) if n_flank else "") + binder_seq + linker
             c_context = ""
 
+        shells = (region.weighted_shells(shell_edges)
+                  if reach_weighted else None)
+
         result = design_flank(
             region.weighted_patch_sequence(patch_weighting),
             length,
+            shells=shells,
             n_context=n_context,
             c_context=c_context,
             selected_patch=region.patch_sequence,

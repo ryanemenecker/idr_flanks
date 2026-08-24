@@ -39,7 +39,10 @@ from .interface import (
     end_to_end_distance,
     find_proximal_region,
     min_distances_to,
+    parse_residue_spec,
     reach_radius,
+    tether_contact_weight,
+    tether_contact_weights,
 )
 from .io import (
     THREE_TO_ONE,
@@ -67,6 +70,7 @@ def __getattr__(name):
     _design = {"DesignConfig", "DesignError", "DesignResult", "PRESETS",
                "design_flank", "score_flank", "epsilon_per_residue",
                "load_epsilon_model", "target_discriminability",
+               "shell_epsilon_class", "shell_weighted_epsilon",
                "idr_amino_acid_frequencies", "context_disorder_class",
                "binder_competition_class", "avoidance_class"}
     _pipeline = {"FlankedBinder", "build_flanked_binder", "describe_chains"}
@@ -105,8 +109,11 @@ __all__ = [
     "find_proximal_region",
     "contact_map",
     "min_distances_to",
+    "parse_residue_spec",
     "reach_radius",
     "end_to_end_distance",
+    "tether_contact_weight",
+    "tether_contact_weights",
     # design (lazily imported)
     "DesignConfig",
     "DesignError",
@@ -117,6 +124,8 @@ __all__ = [
     "epsilon_per_residue",
     "load_epsilon_model",
     "target_discriminability",
+    "shell_epsilon_class",
+    "shell_weighted_epsilon",
     "idr_amino_acid_frequencies",
     "context_disorder_class",
     "binder_competition_class",

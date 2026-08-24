@@ -33,7 +33,10 @@ __all__ = [
     "contact_map",
     "reach_radius",
     "end_to_end_distance",
+    "tether_contact_weight",
+    "tether_contact_weights",
     "min_distances_to",
+    "parse_residue_spec",
 ]
 
 
@@ -167,6 +170,62 @@ _OCCLUSION_RANGE = 7.0
 
 _REACH_PREFACTOR = 6.2
 _REACH_EXPONENT = 0.52
+
+
+def tether_contact_weight(distance: float, flank_length: int,
+                          prefactor: float = _REACH_PREFACTOR,
+                          exponent: float = _REACH_EXPONENT) -> float:
+    r"""Relative density of flank monomers at ``distance`` from the anchor.
+
+    Summing the ideal-chain end distribution over every residue of the flank,
+
+    .. math::
+
+        w(d) = \sum_{i=1}^{N} \left(\frac{3}{2\pi R_i^2}\right)^{3/2}
+               \exp\!\left(-\frac{3 d^2}{2 R_i^2}\right),
+        \qquad R_i = \text{prefactor} \cdot i^{\text{exponent}}
+
+    normalised to 1 at ``d = 0``. Residue *i* is tethered by *i* segments, so it
+    has its own span :math:`R_i`; the sum is the local concentration of flank
+    chemistry a target residue at that distance actually experiences.
+
+    This replaces a linear taper, which over-weighted distant surface by a
+    measured 2.4x at 10 A and 2.8x at 15 A. Derived from the same polymer
+    relation the reach radius uses, not fitted.
+
+    Parameters
+    ----------
+    distance : float
+        Distance from the anchor, in angstroms.
+    flank_length : int
+        Number of residues in the flank.
+    prefactor, exponent : float
+        Polymer scaling parameters.
+
+    Returns
+    -------
+    float
+        Weight in ``(0, 1]``.
+    """
+    return float(tether_contact_weights(
+        np.asarray([distance], dtype=np.float64), flank_length,
+        prefactor, exponent)[0])
+
+
+def tether_contact_weights(distances: np.ndarray, flank_length: int,
+                           prefactor: float = _REACH_PREFACTOR,
+                           exponent: float = _REACH_EXPONENT) -> np.ndarray:
+    """Vectorised :func:`tether_contact_weight` over an array of distances."""
+    if flank_length <= 0:
+        raise ValueError(f"flank_length must be positive, got {flank_length}")
+    d = np.asarray(distances, dtype=np.float64).reshape(-1)
+    i = np.arange(1, int(flank_length) + 1, dtype=np.float64)
+    r2 = (prefactor * i ** exponent) ** 2                      # (N,)
+    amp = (3.0 / (2.0 * np.pi * r2)) ** 1.5                    # (N,)
+    # (n_distances, N) -> sum over residues
+    dens = (amp * np.exp(-1.5 * d[:, None] ** 2 / r2)).sum(axis=1)
+    peak = amp.sum()
+    return dens / peak if peak > 0 else np.zeros_like(dens)
 
 
 def end_to_end_distance(flank_length: int,
@@ -386,6 +445,44 @@ class ProximalRegion:
         return ", ".join(f"{a}-{b}" if a != b else str(a)
                          for a, b in self.spans)
 
+    def weighted_shells(self, edges: Sequence[float] = (5.0, 10.0, 15.0)
+                        ) -> List[Tuple[str, float]]:
+        """Selected residues split into distance shells with tether weights.
+
+        Returns ``[(sequence, weight), ...]``, one entry per non-empty shell,
+        where ``weight`` is the summed tethered-chain contact weight of the
+        residues in it. Handing these to the design step lets the objective be
+        a weighted average over shells rather than a flat average over the whole
+        patch, so surface the flank rarely touches stops dominating.
+
+        Splitting into shells rather than reweighting residue-by-residue is
+        deliberate: FINCHES epsilon takes a sequence, so real-valued weights can
+        only be applied *between* epsilon calls, not within one. A handful of
+        shells costs a handful of epsilon calls.
+
+        Parameters
+        ----------
+        edges : sequence of float
+            Upper bounds of the inner shells, in angstroms. The last shell
+            covers everything beyond the final edge.
+
+        Returns
+        -------
+        list of (str, float)
+        """
+        bounds = list(edges) + [float("inf")]
+        shells: List[Tuple[str, float]] = []
+        for lo, hi in zip([0.0] + list(edges), bounds):
+            members = [p for p in self.residues
+                       if lo <= p.anchor_distance < hi]
+            if not members:
+                continue
+            weight = float(sum(p.weight for p in members))
+            if weight <= 0:
+                continue
+            shells.append(("".join(p.one_letter for p in members), weight))
+        return shells
+
     def summary(self) -> str:
         lines = [
             f"Proximal region on chain {self.target_chain_id!r} "
@@ -420,6 +517,113 @@ class ProximalRegion:
 # ---------------------------------------------------------------------------
 # the main entry point
 # ---------------------------------------------------------------------------
+
+def parse_residue_spec(spec) -> "set":
+    """Interpret a residue selection as a set of author residue numbers.
+
+    Accepted forms, all in author numbering (the numbers a viewer shows):
+
+    ==============================  ==========================================
+    ``"1-100"``                     residues 1 through 100, inclusive
+    ``"1-100,250-300"``             several ranges
+    ``"1-100,150"``                 ranges and single residues mixed
+    ``(1, 100)``                    one inclusive range
+    ``[(1, 100), (250, 300)]``      several ranges
+    ``[1, 100]``                    **a range**, 1 through 100
+    ``[5, 12, 88]``                 those three residues individually
+    ``range(1, 101)``               residues 1 through 100
+    ==============================  ==========================================
+
+    Note the one ambiguous case: a bare pair of integers is read as a *range*,
+    since that is overwhelmingly what it is meant for. Write ``[[5], [12]]`` or
+    ``"5,12"`` for exactly two individual residues. Whatever is parsed is
+    reported back in the region notes, so the interpretation is never silent.
+
+    Parameters
+    ----------
+    spec : str, int, or sequence
+        The selection.
+
+    Returns
+    -------
+    set of int
+    """
+    out: set = set()
+    if spec is None:
+        return out
+
+    if isinstance(spec, str):
+        for part in spec.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part[1:]:                     # allow a leading minus
+                idx = part.index("-", 1)
+                lo, hi = part[:idx], part[idx + 1:]
+                try:
+                    out.update(range(int(lo), int(hi) + 1))
+                except ValueError:
+                    raise ValueError(
+                        f"could not read residue range {part!r}; expected "
+                        f"something like '1-100'") from None
+            else:
+                try:
+                    out.add(int(part))
+                except ValueError:
+                    raise ValueError(
+                        f"could not read residue number {part!r}") from None
+        return out
+
+    if isinstance(spec, int):
+        return {int(spec)}
+
+    items = list(spec)
+    # A bare pair of integers is a range -- the common intent.
+    if len(items) == 2 and all(isinstance(x, int) for x in items):
+        lo, hi = int(items[0]), int(items[1])
+        if hi < lo:
+            raise ValueError(
+                f"residue range ({lo}, {hi}) runs backwards")
+        return set(range(lo, hi + 1))
+
+    for item in items:
+        if isinstance(item, int):
+            out.add(int(item))
+        elif isinstance(item, str):
+            out |= parse_residue_spec(item)
+        else:
+            pair = list(item)
+            if len(pair) == 1:
+                out.add(int(pair[0]))
+            elif len(pair) == 2:
+                lo, hi = int(pair[0]), int(pair[1])
+                if hi < lo:
+                    raise ValueError(
+                        f"residue range ({lo}, {hi}) runs backwards")
+                out.update(range(lo, hi + 1))
+            else:
+                raise ValueError(
+                    f"cannot read {item!r} as a residue or a (start, end) "
+                    f"range")
+    return out
+
+
+def _describe_residue_set(numbers: "set") -> str:
+    """Render a residue set as compact ranges, e.g. ``1-100, 250-300``."""
+    if not numbers:
+        return "none"
+    ordered = sorted(numbers)
+    spans = []
+    start = prev = ordered[0]
+    for n in ordered[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        spans.append((start, prev))
+        start = prev = n
+    spans.append((start, prev))
+    return ", ".join(f"{a}-{b}" if a != b else str(a) for a, b in spans)
+
 
 def _normalize_terminus(terminus: str) -> str:
     t = str(terminus).strip().lower()
@@ -467,6 +671,8 @@ def find_proximal_region(
     surface_threshold: float = 0.10,
     sasa_points: int = 480,
     trust_distal_occlusion: bool = False,
+    exclude_target_residues=None,
+    include_target_residues=None,
 ) -> ProximalRegion:
     """Select the target residues a new flank should be complementary to.
 
@@ -513,6 +719,24 @@ def find_proximal_region(
     sasa_points : int
         Test points per atom for the accessibility calculation. Lower is
         faster; the default is far more than surface classification needs.
+    exclude_target_residues : str or sequence, optional
+        Target residues to remove from consideration entirely, in author
+        numbering. See :func:`parse_residue_spec` for the accepted forms;
+        ``[1, 100]`` and ``"1-100"`` both mean the first hundred residues.
+
+        Use this when you know a region cannot really be at the interface. The
+        automatic sequence-locality filter only removes *small* spurious contact
+        patches; a predictor that folds a whole terminus back onto the true
+        binding site produces a large, self-consistent patch that survives it,
+        and only you know it is wrong.
+
+        Excluded residues take no part in locating the interface either, not
+        just in the final selection -- otherwise the spurious patch would still
+        define an accepted sequence window and let its neighbours through.
+    include_target_residues : str or sequence, optional
+        The complement: consider *only* these target residues. Often the more
+        direct way to say the same thing, e.g. ``include_target_residues="400-"``
+        is expressed as ``(400, last_residue)``.
     trust_distal_occlusion : bool
         Whether target residues that fail the sequence-locality test may still
         occlude solvent. Default ``False``: a predictor that drapes a distant
@@ -590,6 +814,49 @@ def find_proximal_region(
             f"really a complex?"
         )
 
+    # User-declared eligibility, applied BEFORE the interface is located: a
+    # mispredicted region must not get to define an accepted sequence window.
+    excluded_spec = parse_residue_spec(exclude_target_residues)
+    included_spec = parse_residue_spec(include_target_residues)
+
+    def eligible(seq_id: int) -> bool:
+        if included_spec and seq_id not in included_spec:
+            return False
+        return seq_id not in excluded_spec
+
+    if excluded_spec or included_spec:
+        present = {int(r.seq_id) for r in target.residues}
+        if included_spec:
+            missing = included_spec - present
+            if len(missing) == len(included_spec):
+                raise InterfaceError(
+                    f"include_target_residues selects "
+                    f"{_describe_residue_set(included_spec)}, but chain "
+                    f"{target_chain!r} contains none of those residue numbers "
+                    f"(it spans {target[0].seq_id}-{target[-1].seq_id}).")
+            notes.append(
+                f"restricted to target residues "
+                f"{_describe_residue_set(included_spec & present)} as requested.")
+        if excluded_spec:
+            hit = excluded_spec & present
+            notes.append(
+                f"excluded target residues "
+                f"{_describe_residue_set(excluded_spec)} as requested"
+                + (f" ({len(hit)} of them present in this chain)"
+                   if len(hit) != len(excluded_spec) else "")
+                + ".")
+
+    contact_idx = np.array(
+        [i for i in contact_idx if eligible(int(target[i].seq_id))],
+        dtype=np.int64)
+    if contact_idx.size == 0:
+        raise InterfaceError(
+            f"after applying exclude_target_residues/include_target_residues, "
+            f"no contact between chains {binder_chain!r} and {target_chain!r} "
+            f"remains. The eligible region does not touch the binder -- check "
+            f"the numbering, or widen the selection."
+        )
+
     contact_seq_ids = [int(target[i].seq_id) for i in contact_idx]
     clusters = _cluster_seq_ids(contact_seq_ids, cluster_gap)
     kept = [c for c in clusters if len(c) >= min_cluster_contacts]
@@ -656,13 +923,22 @@ def find_proximal_region(
     # surface it was spuriously placed on top of.
     candidate_idx: List[int] = []
     excluded: List[str] = []
+    n_ineligible = 0
     for i, res in enumerate(target.residues):
         if not np.isfinite(d_anchor[i]) or d_anchor[i] > r:
+            continue
+        if not eligible(int(res.seq_id)):
+            n_ineligible += 1
             continue
         if sequence_local(int(res.seq_id)):
             candidate_idx.append(i)
         else:
             excluded.append(res.label)
+
+    if n_ineligible:
+        notes.append(
+            f"{n_ineligible} residue(s) were within reach but ruled out by the "
+            f"target-residue selection you supplied.")
 
     rel_sasa = np.full(len(target), np.nan)
     if require_surface and candidate_idx:
@@ -678,7 +954,8 @@ def find_proximal_region(
             target.residues[i] for i in range(len(target))
             if i not in candidate_set
             and (trust_distal_occlusion
-                 or sequence_local(int(target.residues[i].seq_id)))]
+                 or (sequence_local(int(target.residues[i].seq_id))
+                     and eligible(int(target.residues[i].seq_id))))]
         # Only candidates need an accessibility number, which also keeps the
         # Shrake-Rupley pass off the rest of a large chain.
         het_xyz, het_els = structure.heteroatoms()
@@ -746,11 +1023,14 @@ def find_proximal_region(
 
     selected.sort(key=lambda p: (p.residue.seq_id, p.residue.ins_code))
 
-    # Proximity weight: 1.0 at the anchor falling to 0 at the reach radius.
-    # Consumers that want to emphasise the residues a flank most likely
-    # contacts can use these instead of treating the patch as uniform.
-    for p in selected:
-        p.weight = float(max(0.0, 1.0 - p.anchor_distance / r)) if r > 0 else 1.0
+    # Proximity weight: the tethered-chain monomer density at that distance,
+    # normalised to 1 at the anchor. A linear taper to zero at the reach radius
+    # over-weights distant surface several-fold.
+    if selected:
+        weights = tether_contact_weights(
+            np.array([p.anchor_distance for p in selected]), flank_length)
+        for p, w in zip(selected, weights):
+            p.weight = float(w)
 
     if not selected:
         raise InterfaceError(

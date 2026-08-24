@@ -265,6 +265,8 @@ class TestArgumentRouting:
             "max_residues": 10, "require_surface": True,
             "surface_threshold": 0.12, "sasa_points": 120,
             "trust_distal_occlusion": True,
+            "exclude_target_residues": "25-30",
+            "include_target_residues": None,
         }
         assert set(samples) == set(_INTERFACE_KEYS), (
             "update this test's sample values for new parameters")
@@ -448,6 +450,45 @@ class TestRegionNotesReachWarnings:
         r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
                                  c_flank_length=12, max_residues=3, **FAST)
         assert any("survived the filters" in w for w in r.warnings)
+
+
+class TestTargetResidueSelectionRouting:
+    def test_exclusion_routes_through_the_pipeline(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12,
+                                 exclude_target_residues=[25, 60], **FAST)
+        assert all(not (25 <= s <= 60) for s in r.regions["C"].seq_ids)
+
+    def test_inclusion_routes_through_the_pipeline(self, pdb_path):
+        # 96-109 sits near the C-terminal anchor; 61-75 is near the N-terminal
+        # one and would legitimately be out of reach here.
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=25,
+                                 include_target_residues="96-109", **FAST)
+        ids = r.regions["C"].seq_ids
+        assert ids and all(96 <= s <= 109 for s in ids)
+
+    def test_unreachable_inclusion_errors_helpfully(self, pdb_path):
+        """Restricting to a region the flank cannot reach must say so."""
+        from idr_flanks.interface import InterfaceError
+        with pytest.raises(InterfaceError, match="cannot reach"):
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12,
+                                 include_target_residues="61-75", **FAST)
+
+    def test_selection_notes_reach_the_warnings(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12,
+                                 exclude_target_residues="25-60", **FAST)
+        assert any("excluded target residues" in w for w in r.warnings)
+
+    def test_applies_per_terminus(self, pdb_path):
+        """The selection is about the target, so it applies to both flanks."""
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 n_flank_length=10, c_flank_length=10,
+                                 exclude_target_residues="25-60", **FAST)
+        for term in ("N", "C"):
+            assert all(not (25 <= s <= 60) for s in r.regions[term].seq_ids)
 
 
 class TestErrors:
