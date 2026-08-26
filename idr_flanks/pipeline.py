@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from .design import DesignConfig, DesignResult, design_flank
 from .interface import InterfaceError, ProximalRegion, find_proximal_region
 from .io import Structure, read_structure
 
-__all__ = ["FlankedBinder", "build_flanked_binder", "describe_chains"]
+__all__ = ["FlankedBinder", "build_flanked_binder", "describe_chains",
+           "score_flanks"]
 
 
 # Keyword arguments understood by find_proximal_region, so callers can pass
@@ -171,6 +172,7 @@ def build_flanked_binder(
     patch_weighting: int = 1,
     reach_weighted: bool = True,
     shell_edges: Sequence[float] = (5.0, 10.0, 15.0),
+    auto_detect_region: bool = False,
     interface_options: Optional[Dict[str, Any]] = None,
     **overrides: Any,
 ) -> FlankedBinder:
@@ -216,6 +218,22 @@ def build_flanked_binder(
         likely to touch. ``1`` (the default) weights every reachable residue
         equally. See
         :meth:`~idr_flanks.interface.ProximalRegion.weighted_patch_sequence`.
+    auto_detect_region : bool
+        Allow the target region to be chosen automatically from binder-target
+        contacts. Off by default: you must say which target residues the flank
+        should complement, via ``target_residues`` (or
+        ``include_target_residues``).
+
+        This is deliberate. On predicted structures the automatic interface
+        detection cannot reliably tell a real epitope from an artifact -- a
+        mispredicted region docked onto the binder is spatially,
+        compositionally and in buried area indistinguishable from a genuine
+        second epitope -- so designing against an auto-detected region can
+        silently aim the flank at the wrong surface. Explore the interface first
+        with :func:`find_proximal_region` or ``idr-flanks contacts`` (which show
+        the ranked, artifact-flagged patch report), decide which region is real,
+        then pass it here. Set ``auto_detect_region=True`` only for
+        well-behaved experimental structures where you trust the interface.
     interface_options : dict, optional
         Extra keyword arguments for
         :func:`~idr_flanks.interface.find_proximal_region`.
@@ -304,6 +322,22 @@ def build_flanked_binder(
             iface_kwargs[key] = value
         else:
             design_overrides[key] = value
+
+    if not auto_detect_region and not (
+            iface_kwargs.get("target_residues")
+            or iface_kwargs.get("include_target_residues")):
+        raise ValueError(
+            f"no target region was specified. You must say which residues of "
+            f"target chain {target_chain!r} the flank should complement, e.g. "
+            f"target_residues=[250, 280]. Automatic interface detection is not "
+            f"trustworthy on predicted structures -- a mispredicted region "
+            f"docked onto the binder is indistinguishable from a real epitope "
+            f"-- so it is not used by default. Explore the interface first with "
+            f"describe_chains / find_proximal_region (or `idr-flanks contacts`), "
+            f"which rank the interface patches and flag likely artifacts, then "
+            f"pass the region you trust. To opt into automatic detection anyway "
+            f"(e.g. for a reliable experimental structure), pass "
+            f"auto_detect_region=True.")
 
     binder = struct[binder_chain]
     binder_seq = binder.sequence
@@ -395,6 +429,7 @@ def build_flanked_binder(
             c_context=c_context,
             selected_patch=region.patch_sequence,
             binder_interface=region.binder_interface_sequence,
+            epitope=region.epitope_sequence,
             preset=preset,
             config=config,
             **design_overrides,
@@ -423,3 +458,112 @@ def build_flanked_binder(
         designs=designs,
         structure=struct,
     )
+
+
+def score_flanks(
+    flanks,
+    structure: Union[str, "os.PathLike", Structure],
+    *,
+    binder_chain: str,
+    target_chain: str,
+    terminus: str,
+    flank_length: Optional[int] = None,
+    model: str = "mpipi",
+    reach_weighted: bool = True,
+    shell_edges: Sequence[float] = (5.0, 10.0, 15.0),
+    patch_weighting: int = 1,
+    interface_options: Optional[Dict[str, Any]] = None,
+    **overrides: Any,
+):
+    """Recompute epsilon vs patch / epitope / binder interface for existing flanks.
+
+    Reconstructs the target references from the structure exactly as a design run
+    would, then scores each supplied flank sequence against them -- so you can go
+    back and evaluate flanks made earlier (or by another method) without
+    rerunning the design.
+
+    To reproduce the numbers a particular design reported, pass the SAME
+    ``target_residues`` (and ``flank_length``, ``linker_length`` via
+    ``flank_length``, terminus, cutoffs) you designed with; the patch, epitope
+    and binder interface all depend on them.
+
+    Parameters
+    ----------
+    flanks : str, sequence of str, or mapping of name -> str
+        The flank sequence(s) to score.
+    structure : str, path, or Structure
+        The binder-target complex.
+    binder_chain, target_chain : str
+        Author chain ids.
+    terminus : str
+        ``"N"`` or ``"C"`` -- the end the flank is attached to (sets the anchor
+        and hence the reach-based patch).
+    flank_length : int, optional
+        Flank length used to define reach. Defaults to the length of the first
+        flank. If you designed with a linker, add its length here so the reach
+        (and therefore the patch) matches.
+    model : str
+        Epsilon model.
+    reach_weighted, shell_edges, patch_weighting
+        Must match the design run for the patch to be identical; defaults match
+        :func:`build_flanked_binder`.
+    interface_options, **overrides
+        Passed to :func:`~idr_flanks.interface.find_proximal_region` (e.g.
+        ``target_residues``, ``contact_cutoff``). Pass what you designed with.
+
+    Returns
+    -------
+    FlankEpsilonScores, list, or dict
+        One result per flank, matching the shape of ``flanks`` (a bare string
+        returns a single result; a mapping returns ``{name: result}``).
+
+    Examples
+    --------
+    >>> score_flanks("EPQDNGPYD...", "complex.pdb", binder_chain="A",
+    ...              target_chain="B", terminus="C", target_residues=[250, 280])
+    """
+    from .design import flank_epsilons
+    from .interface import find_proximal_region
+
+    if isinstance(flanks, Mapping):
+        items = list(flanks.items())
+    elif isinstance(flanks, str):
+        items = [(None, flanks)]
+    else:
+        items = [(None, f) for f in flanks]
+    if not items:
+        raise ValueError("no flanks were given")
+
+    struct = (structure if isinstance(structure, Structure)
+              else read_structure(structure))
+
+    length = flank_length if flank_length is not None else len(items[0][1])
+    if length <= 0:
+        raise ValueError("flank_length must be positive")
+
+    iface_kwargs: Dict[str, Any] = dict(interface_options or {})
+    iface_kwargs.update(overrides)
+
+    region = find_proximal_region(
+        struct, binder_chain=binder_chain, target_chain=target_chain,
+        terminus=terminus, flank_length=length, **iface_kwargs)
+
+    patch = region.weighted_patch_sequence(patch_weighting)
+    shells = region.weighted_shells(shell_edges) if reach_weighted else None
+
+    results = {}
+    ordered = []
+    for name, seq in items:
+        scored = flank_epsilons(
+            seq, patch=patch, epitope=region.epitope_sequence,
+            binder_interface=region.binder_interface_sequence,
+            shells=shells, model=model)
+        ordered.append(scored)
+        if name is not None:
+            results[name] = scored
+
+    if isinstance(flanks, Mapping):
+        return results
+    if isinstance(flanks, str):
+        return ordered[0]
+    return ordered

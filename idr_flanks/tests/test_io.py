@@ -561,6 +561,45 @@ class TestHetatmOrdering:
         assert not s.warnings
 
 
+class TestPlddtDetection:
+    """The B-factor column holds pLDDT in predicted structures. Detect it only
+    from an explicit declaration, never from magnitude."""
+
+    USER = ("idr_flanks/data/structures/"
+            "test_binder_chain_A_target_chain_B.cif")
+
+    def test_predicted_cif_is_detected(self):
+        import os
+        if not os.path.isfile(self.USER):
+            import pytest
+            pytest.skip("user structure not present")
+        assert read_structure(self.USER).plddt_from_bfactor is True
+
+    def test_crystal_structures_are_not(self):
+        assert read_structure(structure_path("1ycr.pdb")).plddt_from_bfactor is False
+        assert read_structure(structure_path("1ycr.cif")).plddt_from_bfactor is False
+
+    def test_alphafold_pdb_remark_is_detected(self, tmp_path):
+        pdb = """
+            REMARK   1  pLDDT per-residue confidence in the B-factor column
+            ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 88.00           C
+            ATOM      2  CA  GLY A   2       3.800   0.000   0.000  1.00 91.00           C
+            END
+        """
+        s = read_pdb(_write(tmp_path, "af.pdb", pdb))
+        assert s.plddt_from_bfactor is True
+
+    def test_not_guessed_from_magnitude(self, tmp_path):
+        """High B-factors in a plain PDB must not be read as pLDDT."""
+        pdb = """
+            ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 88.00           C
+            ATOM      2  CA  GLY A   2       3.800   0.000   0.000  1.00 91.00           C
+            END
+        """
+        s = read_pdb(_write(tmp_path, "plain.pdb", pdb))
+        assert s.plddt_from_bfactor is False
+
+
 class TestFullSequence:
     """SEQRES / _entity_poly give the chain as deposited. Without it, missing
     *termini* are invisible -- and that is where a flank gets attached."""

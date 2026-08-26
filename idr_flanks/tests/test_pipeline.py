@@ -18,7 +18,8 @@ from idr_flanks.pipeline import (  # noqa: E402
 P53 = "ETFSDLWKLLPEN"
 MDM2 = ("ETLVRPKPLLLKLLKSVGAQKDTYTMKEVLFYLGQYIMTKRLYDEKQQHIVYCSNDLLGD"
         "LFGVPSFSVKEHRKIYTMIYRNLVV")
-FAST = dict(max_iterations=120, num_starting_candidates=60, seed=17)
+FAST = dict(max_iterations=120, num_starting_candidates=60, seed=17,
+            auto_detect_region=True)
 
 
 @pytest.fixture(scope="module")
@@ -267,6 +268,11 @@ class TestArgumentRouting:
             "trust_distal_occlusion": True,
             "exclude_target_residues": "25-30",
             "include_target_residues": None,
+            "target_residues": None,
+            "exclude_epitope": False,
+            "epitope_cutoff": 6.0,
+            "dominant_epitope_only": False,
+            "report_patches": True,
         }
         assert set(samples) == set(_INTERFACE_KEYS), (
             "update this test's sample values for new parameters")
@@ -274,12 +280,14 @@ class TestArgumentRouting:
             build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
                                  c_flank_length=6, max_iterations=30,
                                  num_starting_candidates=15, seed=1,
+                                 auto_detect_region=True,
                                  **{name: value})
 
     def test_unknown_option_is_rejected(self, pdb_path):
         with pytest.raises(TypeError):
             build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
-                                 c_flank_length=10, bogus_option=1)
+                                 c_flank_length=10, auto_detect_region=True,
+                                 bogus_option=1)
 
 
 class TestFormatAgnostic:
@@ -298,11 +306,27 @@ class TestFormatAgnostic:
         assert r.structure is struct
 
 
+class TestEpitopeOnlyTarget:
+    def test_a_target_that_is_all_epitope_errors_informatively(self, pdb_path):
+        """If every reachable residue is epitope there is no adjacent surface
+        to add to, and saying so is the correct answer."""
+        from idr_flanks.interface import InterfaceError
+        with pytest.raises(InterfaceError, match="own epitope"):
+            build_flanked_binder(pdb_path, binder_chain="A", target_chain="B",
+                                 c_flank_length=12, **FAST)
+
+
 class TestReversedRoles:
     def test_mdm2_can_be_the_binder(self, pdb_path):
-        """Either chain may be the binder; nothing hard-codes the roles."""
+        """Either chain may be the binder; nothing hard-codes the roles.
+
+        exclude_epitope is off here because the p53 peptide target is only 13
+        residues and almost all of it contacts MDM2 -- there is no adjacent
+        surface, which the guard would correctly report as an error.
+        """
         r = build_flanked_binder(pdb_path, binder_chain="A", target_chain="B",
-                                 c_flank_length=12, **FAST)
+                                 c_flank_length=12, exclude_epitope=False,
+                                 **FAST)
         assert r.binder_sequence == MDM2
         assert r.final_sequence.startswith(MDM2)
         assert r.target_chain == "B"
@@ -452,6 +476,85 @@ class TestRegionNotesReachWarnings:
         assert any("survived the filters" in w for w in r.warnings)
 
 
+class TestRequiredTargetRegion:
+    """A target region must be specified by default: automatic interface
+    detection is not trustworthy on predicted structures."""
+
+    def test_no_region_is_an_error(self, pdb_path):
+        with pytest.raises(ValueError, match="no target region was specified"):
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12,
+                                 max_iterations=30, num_starting_candidates=15,
+                                 seed=1)
+
+    def test_error_points_to_the_remedy(self, pdb_path):
+        with pytest.raises(ValueError) as exc:
+            build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12)
+        msg = str(exc.value)
+        assert "target_residues" in msg
+        assert "auto_detect_region=True" in msg
+        assert "contacts" in msg
+
+    def test_target_residues_satisfies_the_requirement(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, target_residues=[96, 109],
+                                 max_iterations=30, num_starting_candidates=15,
+                                 seed=1)
+        assert r.regions["C"].seq_ids
+
+    def test_include_target_residues_satisfies_it(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=25,
+                                 include_target_residues="96-109",
+                                 max_iterations=30, num_starting_candidates=15,
+                                 seed=1)
+        assert r.regions["C"].seq_ids
+
+    def test_region_via_interface_options_satisfies_it(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12,
+                                 interface_options={"target_residues": [96, 109]},
+                                 max_iterations=30, num_starting_candidates=15,
+                                 seed=1)
+        assert r.regions["C"].seq_ids
+
+    def test_auto_detect_region_opt_in_works(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=12, auto_detect_region=True,
+                                 max_iterations=30, num_starting_candidates=15,
+                                 seed=1)
+        assert r.regions["C"].seq_ids
+
+    def test_find_proximal_region_still_auto_detects(self, pdb_path):
+        """The primitive is unchanged -- it is what exploration uses."""
+        from idr_flanks.interface import find_proximal_region
+        region = find_proximal_region(read_structure(pdb_path), "B", "A", "C", 25)
+        assert region.seq_ids
+
+
+class TestArtifactReport:
+    USER = ("idr_flanks/data/structures/"
+            "test_binder_chain_A_target_chain_B.cif")
+
+    def test_artifact_remedy_reaches_warnings(self):
+        import os
+        if not os.path.isfile(self.USER):
+            pytest.skip("user structure not present")
+        r = build_flanked_binder(self.USER, binder_chain="A", target_chain="B",
+                                 n_flank_length=30, **FAST)
+        assert any("target_residues=[255, 323]" in w for w in r.warnings)
+
+    def test_dominant_epitope_only_routes(self):
+        import os
+        if not os.path.isfile(self.USER):
+            pytest.skip("user structure not present")
+        r = build_flanked_binder(self.USER, binder_chain="A", target_chain="B",
+                                 n_flank_length=30,
+                                 dominant_epitope_only=True, **FAST)
+        assert all(255 <= s <= 323 for s in r.regions["N"].seq_ids)
+
+
 class TestTargetResidueSelectionRouting:
     def test_exclusion_routes_through_the_pipeline(self, pdb_path):
         r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
@@ -476,6 +579,13 @@ class TestTargetResidueSelectionRouting:
                                  c_flank_length=12,
                                  include_target_residues="61-75", **FAST)
 
+    def test_target_residues_routes_through_the_pipeline(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=25,
+                                 target_residues=[96, 109], **FAST)
+        ids = r.regions["C"].seq_ids
+        assert ids and all(96 <= s <= 109 for s in ids)
+
     def test_selection_notes_reach_the_warnings(self, pdb_path):
         r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
                                  c_flank_length=12,
@@ -489,6 +599,73 @@ class TestTargetResidueSelectionRouting:
                                  exclude_target_residues="25-60", **FAST)
         for term in ("N", "C"):
             assert all(not (25 <= s <= 60) for s in r.regions[term].seq_ids)
+
+
+class TestScoreFlanks:
+    """Retrospective scoring of existing flanks from the structure."""
+
+    def _designed(self, pdb_path):
+        r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
+                                 c_flank_length=20, target_residues=[96, 109],
+                                 max_iterations=120, num_starting_candidates=60,
+                                 seed=17)
+        return r.designs["C"], r.c_flank
+
+    def test_matches_a_fresh_design_exactly(self, pdb_path):
+        from idr_flanks.pipeline import score_flanks
+        design, flank = self._designed(pdb_path)
+        s = score_flanks(flank, pdb_path, binder_chain="B", target_chain="A",
+                         terminus="C", flank_length=20,
+                         target_residues=[96, 109])
+        assert s.epsilon_vs_patch_reach_weighted == pytest.approx(
+            design.epsilon_weighted, abs=1e-9)
+        assert s.epsilon_vs_patch == pytest.approx(
+            design.epsilon_per_residue, abs=1e-9)
+        assert s.epsilon_vs_epitope == pytest.approx(
+            design.epsilon_vs_epitope, abs=1e-9)
+        assert s.epsilon_vs_binder_interface == pytest.approx(
+            design.epsilon_vs_binder_interface, abs=1e-9)
+
+    def test_single_string_returns_one_result(self, pdb_path):
+        from idr_flanks.pipeline import score_flanks
+        from idr_flanks.design import FlankEpsilonScores
+        s = score_flanks("EEQDDQQQQWDEEEQWDDQQ", pdb_path, binder_chain="B",
+                         target_chain="A", terminus="C",
+                         target_residues=[96, 109])
+        assert isinstance(s, FlankEpsilonScores)
+
+    def test_list_returns_list(self, pdb_path):
+        from idr_flanks.pipeline import score_flanks
+        out = score_flanks(["EEQDDQQQQWDEEEQWDDQQ", "KRKRKRKRKRKRKRKRKRKR"],
+                           pdb_path, binder_chain="B", target_chain="A",
+                           terminus="C", flank_length=20,
+                           target_residues=[96, 109])
+        assert isinstance(out, list) and len(out) == 2
+
+    def test_mapping_returns_mapping(self, pdb_path):
+        from idr_flanks.pipeline import score_flanks
+        out = score_flanks({"a": "EEQDDQQQQWDEEEQWDDQQ",
+                            "b": "GSGSGSGSGSGSGSGSGSGS"},
+                           pdb_path, binder_chain="B", target_chain="A",
+                           terminus="C", flank_length=20,
+                           target_residues=[96, 109])
+        assert set(out) == {"a", "b"}
+
+    def test_flank_length_defaults_to_first_flank(self, pdb_path):
+        from idr_flanks.pipeline import score_flanks
+        s = score_flanks("EEQDDQQQQWDEEEQWDDQQ", pdb_path, binder_chain="B",
+                         target_chain="A", terminus="C",
+                         target_residues=[96, 109])
+        assert s.epsilon_vs_patch == s.epsilon_vs_patch
+
+    def test_scoring_does_not_require_a_region_but_reproducing_a_design_does(
+            self, pdb_path):
+        """score_flanks is analysis, so it may auto-detect; but the docstring
+        tells the user to pass the same target_residues to match a design."""
+        from idr_flanks.pipeline import score_flanks
+        s = score_flanks("EEQDDQQQQWDEEEQWDDQQ", pdb_path, binder_chain="B",
+                         target_chain="A", terminus="C")
+        assert s.patch_sequence
 
 
 class TestErrors:
@@ -515,7 +692,8 @@ class TestErrors:
 class TestReproducibility:
     def test_same_seed_same_construct(self, pdb_path):
         kwargs = dict(binder_chain="B", target_chain="A", c_flank_length=15,
-                      max_iterations=120, num_starting_candidates=60, seed=5)
+                      max_iterations=120, num_starting_candidates=60, seed=5,
+                      auto_detect_region=True)
         a = build_flanked_binder(pdb_path, **kwargs)
         b = build_flanked_binder(pdb_path, **kwargs)
         assert a.final_sequence == b.final_sequence
@@ -641,7 +819,8 @@ class TestBinderInterfacePassedThrough:
         r = build_flanked_binder(pdb_path, binder_chain="B", target_chain="A",
                                  c_flank_length=20, seed=3,
                                  max_iterations=300,
-                                 num_starting_candidates=120)
+                                 num_starting_candidates=120,
+                                 auto_detect_region=True)
         design = r.designs["C"]
         assert (design.epsilon_vs_binder_interface
                 > design.epsilon_per_residue)

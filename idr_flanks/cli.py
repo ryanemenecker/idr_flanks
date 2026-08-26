@@ -62,8 +62,18 @@ def _build_parser() -> argparse.ArgumentParser:
                             "e.g. '1-100' or '1-100,250-300'. Use when a "
                             "predictor has folded a region onto the real "
                             "binding site.")
+        p.add_argument("--target-residues", metavar="SPEC", default=None,
+                       help="use only this region of the target, e.g. "
+                            "'245-275'. Usually the most direct way to say "
+                            "what you mean.")
         p.add_argument("--include-target", metavar="SPEC", default=None,
-                       help="consider only these target residues, same format")
+                       help=argparse.SUPPRESS)
+        p.add_argument("--dominant-epitope-only", action="store_true",
+                       help="when the target shows several interface patches, "
+                            "use only the one burying the most surface "
+                            "(reproduces a manual target_residues fix for "
+                            "predicted-structure artifacts; may drop a genuine "
+                            "second epitope lobe)")
         p.add_argument("--trust-distal-occlusion", action="store_true",
                        help="let sequence-distant target regions occlude "
                             "solvent (appropriate for experimental, not "
@@ -102,6 +112,11 @@ def _build_parser() -> argparse.ArgumentParser:
     design.add_argument("--linker", type=int, default=0, metavar="N",
                         help="insert an N-residue GS linker between each flank "
                              "and the binder")
+    design.add_argument("--auto-detect-region", action="store_true",
+                        help="allow the target region to be chosen "
+                             "automatically from contacts (unreliable on "
+                             "predicted structures); by default you must give "
+                             "--target-residues")
     design.add_argument("--min-target-preference", type=float, default=None,
                         help="how much more the flank must prefer the target "
                              "over the binder's own interface, per residue "
@@ -124,7 +139,9 @@ def _interface_kwargs(args: argparse.Namespace) -> dict:
         "require_surface": not args.no_surface_filter,
         "max_residues": args.max_residues,
         "trust_distal_occlusion": args.trust_distal_occlusion,
+        "dominant_epitope_only": args.dominant_epitope_only,
         "exclude_target_residues": args.exclude_target,
+        "target_residues": args.target_residues,
         "include_target_residues": args.include_target,
     }
 
@@ -165,6 +182,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "design":
             if args.n_flank <= 0 and args.c_flank <= 0:
                 parser.error("give --n-flank and/or --c-flank a positive length")
+            if (not args.auto_detect_region and not args.target_residues
+                    and not args.include_target):
+                parser.error(
+                    "specify the target region with --target-residues "
+                    "(e.g. --target-residues 250-280). Run `idr-flanks "
+                    "contacts` first to see the interface patches and pick "
+                    "one; automatic detection is unreliable on predicted "
+                    "structures. Use --auto-detect-region to override.")
             from .pipeline import build_flanked_binder
 
             overrides = {}
@@ -192,6 +217,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 linker_length=args.linker,
                 reach_weighted=not args.no_reach_weighting,
                 patch_weighting=args.patch_weighting,
+                auto_detect_region=args.auto_detect_region,
                 interface_options=_interface_kwargs(args),
                 **overrides,
             )

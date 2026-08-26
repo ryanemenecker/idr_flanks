@@ -72,8 +72,11 @@ def __getattr__(name):
                "load_epsilon_model", "target_discriminability",
                "shell_epsilon_class", "shell_weighted_epsilon",
                "idr_amino_acid_frequencies", "context_disorder_class",
-               "binder_competition_class", "avoidance_class"}
-    _pipeline = {"FlankedBinder", "build_flanked_binder", "describe_chains"}
+               "binder_competition_class", "avoidance_class",
+               "flank_epsilons", "FlankEpsilonScores",
+               "shell_weighted_epsilon"}
+    _pipeline = {"FlankedBinder", "build_flanked_binder", "describe_chains",
+                 "score_flanks"}
     if name in _design:
         from . import design
         return getattr(design, name)
@@ -123,6 +126,8 @@ __all__ = [
     "score_flank",
     "epsilon_per_residue",
     "load_epsilon_model",
+    "flank_epsilons",
+    "FlankEpsilonScores",
     "target_discriminability",
     "shell_epsilon_class",
     "shell_weighted_epsilon",
@@ -134,4 +139,5 @@ __all__ = [
     "FlankedBinder",
     "build_flanked_binder",
     "describe_chains",
+    "score_flanks",
 ]

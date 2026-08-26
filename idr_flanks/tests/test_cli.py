@@ -94,7 +94,7 @@ class TestContacts:
 @pytest.mark.usefixtures("_needs_goose")
 class TestDesign:
     def test_quiet_prints_only_the_sequence(self, capsys):
-        code = main(["design", PDB, "-b", "B", "-t", "A", "-c", "12",
+        code = main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "12",
                      "--seed", "3", "--iterations", "80", "--quiet"])
         assert code == 0
         out = capsys.readouterr().out.strip().splitlines()
@@ -103,7 +103,7 @@ class TestDesign:
         assert len(out[0]) == len(P53) + 12
 
     def test_full_output_has_the_summary(self, capsys):
-        code = main(["design", PDB, "-b", "B", "-t", "A", "-c", "12",
+        code = main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "12",
                      "--seed", "3", "--iterations", "80"])
         assert code == 0
         out = capsys.readouterr().out
@@ -111,14 +111,14 @@ class TestDesign:
         assert "final construct" in out
 
     def test_n_terminal_flank(self, capsys):
-        main(["design", PDB, "-b", "B", "-t", "A", "-n", "12",
+        main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-n", "12",
               "--seed", "3", "--iterations", "80", "--quiet"])
         seq = capsys.readouterr().out.strip()
         assert seq.endswith(P53)
 
     def test_writes_fasta(self, capsys, tmp_path):
         out = tmp_path / "design.fa"
-        code = main(["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+        code = main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "10",
                      "--seed", "3", "--iterations", "80", "--quiet",
                      "--fasta", str(out)])
         assert code == 0
@@ -127,7 +127,7 @@ class TestDesign:
         assert "".join(text.splitlines()[1:]) == capsys.readouterr().out.strip()
 
     def test_max_aromatic_is_honoured(self, capsys):
-        main(["design", PDB, "-b", "B", "-t", "A", "-c", "20",
+        main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "20",
               "--seed", "3", "--iterations", "80", "--quiet",
               "--max-aromatic", "0.0"])
         seq = capsys.readouterr().out.strip()
@@ -135,17 +135,17 @@ class TestDesign:
         assert sum(flank.count(a) for a in "WFY") == 0
 
     def test_preset_is_accepted(self, capsys):
-        assert main(["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+        assert main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "10",
                      "--preset", "soluble", "--seed", "3",
                      "--iterations", "80", "--quiet"]) == 0
 
     def test_bad_preset_is_a_clean_error(self, capsys):
-        assert main(["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+        assert main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "10",
                      "--preset", "nonsense", "--iterations", "80"]) == 1
         assert "Unknown preset" in capsys.readouterr().err
 
     def test_seed_is_reproducible(self, capsys):
-        args = ["design", PDB, "-b", "B", "-t", "A", "-c", "12",
+        args = ["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "12",
                 "--seed", "8", "--iterations", "80", "--quiet"]
         main(args)
         first = capsys.readouterr().out
@@ -154,7 +154,7 @@ class TestDesign:
 
     def test_requires_a_flank_length(self):
         with pytest.raises(SystemExit):
-            main(["design", PDB, "-b", "B", "-t", "A"])
+            main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A"])
 
 
 class TestQuietStillWarns:
@@ -171,32 +171,32 @@ class TestQuietStillWarns:
         return str(p)
 
     def test_stdout_is_only_the_sequence(self, gapped, capsys):
-        assert main(["design", gapped, "-b", "B", "-t", "A", "-c", "10",
+        assert main(["design", "--auto-detect-region", gapped, "-b", "B", "-t", "A", "-c", "10",
                      "--seed", "1", "--iterations", "40", "--quiet"]) == 0
         cap = capsys.readouterr()
         assert len(cap.out.strip().splitlines()) == 1
 
     def test_warnings_go_to_stderr(self, gapped, capsys):
-        main(["design", gapped, "-b", "B", "-t", "A", "-c", "10",
+        main(["design", "--auto-detect-region", gapped, "-b", "B", "-t", "A", "-c", "10",
               "--seed", "1", "--iterations", "40", "--quiet"])
         cap = capsys.readouterr()
         assert "unresolved break" in cap.err
         assert "unresolved break" not in cap.out
 
-    def test_stderr_carries_only_prefixed_warnings(self, capsys):
-        """1YCR is itself truncated, so warnings are expected here. What must
-        hold is that stderr is warnings-only and stdout stays parseable."""
-        main(["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+    def test_stdout_clean_and_stderr_carries_warnings(self, capsys):
+        """1YCR is itself truncated, so warnings are expected. stdout must stay
+        a single parseable line; stderr carries the warnings (which may be
+        multi-line, e.g. a ranked-patch table)."""
+        main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "10",
               "--seed", "1", "--iterations", "40", "--quiet"])
         cap = capsys.readouterr()
         assert len(cap.out.strip().splitlines()) == 1
-        for line in cap.err.strip().splitlines():
-            assert line.startswith("warning: ")
+        assert cap.err.strip().startswith("warning: ")
 
 
 class TestNewFlags:
     def test_linker_changes_the_construct(self, capsys):
-        args = ["design", PDB, "-b", "B", "-t", "A", "-c", "10",
+        args = ["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "10",
                 "--seed", "1", "--iterations", "40", "--quiet"]
         main(args)
         plain = capsys.readouterr().out.strip()
@@ -215,7 +215,7 @@ class TestNewFlags:
 
     def test_min_target_preference_changes_the_design(self, capsys):
         """Not just an exit code: the flag must reach the objective."""
-        base = ["design", PDB, "-b", "B", "-t", "A", "-c", "20",
+        base = ["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "20",
                 "--seed", "1", "--iterations", "150", "--quiet"]
         main(base + ["--min-target-preference", "0"])
         off = capsys.readouterr().out.strip()
@@ -250,6 +250,14 @@ class TestTargetSelectionFlags:
               "--exclude-target", "25-60"])
         assert "excluded target residues 25-60" in capsys.readouterr().out
 
+    def test_target_residues_flag(self, capsys):
+        main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25",
+              "--target-residues", "96-109"])
+        out = capsys.readouterr().out
+        assert "restricted to target residues" in out
+        spans = next(l for l in out.splitlines() if "spans" in l)
+        assert "96" in spans or "97" in spans
+
     def test_include_target_restricts(self, capsys):
         main(["contacts", PDB, "-b", "B", "-t", "A", "-c", "25",
               "--include-target", "61-75"])
@@ -269,7 +277,7 @@ class TestTargetSelectionFlags:
         assert "error:" in capsys.readouterr().err
 
     def test_design_accepts_the_flag(self, capsys):
-        code = main(["design", PDB, "-b", "B", "-t", "A", "-c", "12",
+        code = main(["design", "--auto-detect-region", PDB, "-b", "B", "-t", "A", "-c", "12",
                      "--exclude-target", "25-60", "--seed", "1",
                      "--iterations", "40", "--quiet"])
         assert code == 0

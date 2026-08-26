@@ -517,19 +517,133 @@ class TestShellWeightedObjective:
         assert r.epsilon_weighted != r.epsilon_weighted
         assert "reach-weighted epsilon" not in r.summary()
 
+    def _region(self, terminus):
+        from idr_flanks.data import structure_path
+        from idr_flanks.interface import find_proximal_region
+        from idr_flanks.io import read_structure
+        s = read_structure(structure_path("1ycr.pdb"))
+        return (find_proximal_region(s, "B", "A", terminus, 25),
+                s["B"].sequence)
+
     def test_weighting_improves_near_shell_attraction(self):
-        """The trade it exists to make: better on reachable surface."""
-        region, binder = self._shells()
+        """The trade it exists to make: better on the surface actually reached.
+
+        Uses the N-terminus, whose innermost shell (DEISE) is acidic and so has
+        chemistry a flank can complement. See the companion test for what
+        happens when it does not.
+        """
+        from idr_flanks.design import shell_weighted_epsilon
+        region, binder = self._region("N")
+        shells = region.weighted_shells()
+        common = dict(c_context=binder, seed=7, max_iterations=300,
+                      num_starting_candidates=120)
+        flat = design_flank(region.patch_sequence, 25, **common)
+        weighted = design_flank(region.patch_sequence, 25, shells=shells,
+                                **common)
+        near = [shells[0]]
+        assert (shell_weighted_epsilon(weighted.sequence, near)
+                < shell_weighted_epsilon(flat.sequence, near))
+        assert (shell_weighted_epsilon(weighted.sequence, shells)
+                < shell_weighted_epsilon(flat.sequence, shells))
+
+    def test_weighting_is_a_no_op_without_complementable_near_chemistry(self):
+        """Honest limit: if the near shell offers nothing to complement,
+        re-aiming at it cannot help. 1YCR's C-terminal near shell is LTETV."""
+        from idr_flanks.design import shell_weighted_epsilon
+        region, binder = self._region("C")
         shells = region.weighted_shells()
         common = dict(n_context=binder, seed=7, max_iterations=300,
                       num_starting_candidates=120)
         flat = design_flank(region.patch_sequence, 25, **common)
         weighted = design_flank(region.patch_sequence, 25, shells=shells,
                                 **common)
-        from idr_flanks.design import shell_weighted_epsilon
-        near = [shells[0]]
-        assert (shell_weighted_epsilon(weighted.sequence, near)
-                < shell_weighted_epsilon(flat.sequence, near))
+        a = shell_weighted_epsilon(flat.sequence, shells)
+        b = shell_weighted_epsilon(weighted.sequence, shells)
+        assert abs(a - b) < 0.01
+
+
+class TestFlankEpsilons:
+    """Retrospective per-reference epsilon scoring of an existing flank."""
+
+    def test_matches_manual_epsilon(self):
+        from idr_flanks.design import flank_epsilons, load_epsilon_model
+        mf = load_epsilon_model("mpipi")
+        seq = "EEEDDDEEEDDDEEE"
+        r = flank_epsilons(seq, patch="KKKRRR", epitope="DDDEEE",
+                           binder_interface="LLVFAM")
+        assert r.epsilon_vs_patch == pytest.approx(
+            mf.epsilon(seq, "KKKRRR") / len(seq))
+        assert r.epsilon_vs_epitope == pytest.approx(
+            mf.epsilon(seq, "DDDEEE") / len(seq))
+        assert r.epsilon_vs_binder_interface == pytest.approx(
+            mf.epsilon(seq, "LLVFAM") / len(seq))
+
+    def test_missing_references_are_nan(self):
+        from idr_flanks.design import flank_epsilons
+        r = flank_epsilons("EEEDDD", patch="KKKRRR")
+        assert r.epsilon_vs_patch == r.epsilon_vs_patch          # not nan
+        assert r.epsilon_vs_epitope != r.epsilon_vs_epitope      # nan
+        assert r.epsilon_vs_binder_interface != r.epsilon_vs_binder_interface
+
+    def test_reach_weighted_from_shells(self):
+        from idr_flanks.design import flank_epsilons, shell_weighted_epsilon
+        seq = "EEEDDDEEEDDD"
+        shells = [("KKR", 3.0), ("EDD", 1.0)]
+        r = flank_epsilons(seq, patch="KKREDD", shells=shells)
+        assert r.epsilon_vs_patch_reach_weighted == pytest.approx(
+            shell_weighted_epsilon(seq, shells))
+
+    def test_target_preference_uses_reach_weighted_when_present(self):
+        from idr_flanks.design import flank_epsilons
+        r = flank_epsilons("EEEDDDEEEDDD", patch="KKREDD",
+                           binder_interface="LLVFAM",
+                           shells=[("KKR", 3.0), ("EDD", 1.0)])
+        assert r.target_preference == pytest.approx(
+            r.epsilon_vs_binder_interface - r.epsilon_vs_patch_reach_weighted)
+
+    def test_empty_sequence_rejected(self):
+        from idr_flanks.design import flank_epsilons
+        with pytest.raises(ValueError):
+            flank_epsilons("", patch="KKK")
+
+    def test_summary_lists_the_scored_references(self):
+        from idr_flanks.design import flank_epsilons
+        text = flank_epsilons("EEEDDD", patch="KKK",
+                              binder_interface="LLV").summary()
+        assert "vs target patch" in text
+        assert "vs binder interface" in text
+        assert "(not scored)" in text          # epitope omitted
+
+
+class TestEpitopeCompetition:
+    """Excluding the epitope from the patch does not stop the flank binding it:
+    the epitope and the surface beside it are the same protein face."""
+
+    EPITOPE = "ETMKLLGIMYKQQHVFVKHIYY"
+
+    def test_epsilon_vs_epitope_is_reported(self):
+        r = design_flank(PATCH, 20, c_context=BINDER, epitope=self.EPITOPE,
+                         seed=1, **FAST)
+        assert r.epitope_sequence == self.EPITOPE
+        assert r.epsilon_vs_epitope == r.epsilon_vs_epitope
+
+    def test_absent_without_an_epitope(self):
+        r = design_flank(PATCH, 20, c_context=BINDER, seed=1, **FAST)
+        assert r.epsilon_vs_epitope != r.epsilon_vs_epitope
+        assert "vs target epitope" not in r.summary()
+
+    def test_preference_for_the_epitope_is_warned_about(self):
+        """Aim at a patch whose neighbouring epitope is more complementable."""
+        r = design_flank("GSGSGSGSGSGSGS", 20, c_context=BINDER,
+                         epitope="DDDDEEEEDDDDEEEE", seed=1, **FAST)
+        if r.epsilon_vs_epitope < r.epsilon_per_residue:
+            assert any("own epitope" in w for w in r.warnings)
+
+    def test_no_warning_when_the_patch_wins(self):
+        r = design_flank("DDDDEEEEDDDDEEEE", 20, c_context=BINDER,
+                         epitope="GSGSGSGSGSGSGS", seed=1, **FAST)
+        assert r.epsilon_vs_epitope > r.epsilon_per_residue
+        assert not any("own epitope" in w for w in r.warnings)
 
 
 class TestBinderCompetition:
@@ -568,6 +682,36 @@ class TestBinderCompetition:
                          binder_interface="ETFSLWLLPEN", seed=1, **FAST)
         assert r.binder_interface_sequence == "ETFSLWLLPEN"
         assert r.epsilon_vs_binder_interface == r.epsilon_vs_binder_interface
+
+    def test_guard_compares_against_what_was_optimised(self):
+        """When the objective is reach-weighted the guard must use the same
+        quantity, not the flat patch, or it protects a different target."""
+        from idr_flanks.data import structure_path
+        from idr_flanks.interface import find_proximal_region
+        from idr_flanks.io import read_structure
+        s = read_structure(structure_path("1ycr.pdb"))
+        reg = find_proximal_region(s, "B", "A", "C", 25)
+        r = design_flank(reg.patch_sequence, 25, n_context=s["B"].sequence,
+                         binder_interface=reg.binder_interface_sequence,
+                         shells=reg.weighted_shells(), seed=7,
+                         max_iterations=200, num_starting_candidates=80)
+        assert r.target_epsilon == pytest.approx(r.epsilon_weighted)
+        assert r.target_preference == pytest.approx(
+            r.epsilon_vs_binder_interface - r.epsilon_weighted)
+
+    def test_target_epsilon_falls_back_to_the_flat_patch(self):
+        r = design_flank(PATCH, 20, n_context=BINDER,
+                         binder_interface="ETFSLWLLPEN", seed=1, **FAST)
+        assert r.target_epsilon == pytest.approx(r.epsilon_per_residue)
+
+    def test_discriminability_accepts_shells(self):
+        from idr_flanks.design import target_discriminability
+        flat = target_discriminability(PATCH, "ETFSLWLLPEN")
+        shelled = target_discriminability(
+            PATCH, "ETFSLWLLPEN",
+            target_shells=[(PATCH[:10], 3.0), (PATCH[10:], 1.0)])
+        assert flat > 0 and shelled > 0
+        assert flat != shelled
 
     def test_guard_is_free_when_surfaces_differ(self):
         """On a real pairing the guard should cost nothing."""

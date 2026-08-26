@@ -23,7 +23,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from .io import Chain, Residue, Structure
-from .sasa import relative_residue_sasa
+from .sasa import relative_residue_sasa, residue_sasa
 
 __all__ = [
     "ProximalResidue",
@@ -167,6 +167,16 @@ _REACH_PREFACTOR_DOC = None
 # Two heavy atoms can only occlude each other's solvent shell within roughly
 # r_i + r_j + 2 * probe_radius; 7 A covers the largest protein pairing.
 _OCCLUSION_RANGE = 7.0
+
+# A non-dominant interface patch is flagged as a likely prediction artifact when
+# it is BOTH minor (buries less than this fraction of the dominant patch's area)
+# AND anchor-detached (its closest approach to the flank's attachment point is
+# more than this multiple of the dominant patch's). Both conditions are needed:
+# on 1YCR the genuine second cleft patch is 68% of the dominant area and sits at
+# the anchor, so it is not flagged. These are heuristic hint thresholds for a
+# REPORT, never a silent filter -- see find_proximal_region.
+_ARTIFACT_BSA_FRACTION = 0.5
+_ARTIFACT_ANCHOR_MULTIPLE = 2.0
 
 _REACH_PREFACTOR = 6.2
 _REACH_EXPONENT = 0.52
@@ -325,6 +335,9 @@ class ProximalRegion:
     reach_radius: float
     contact_labels: List[str] = field(default_factory=list)
     excluded_labels: List[str] = field(default_factory=list)
+    epitope_sequence: str = ""
+    """The target's own epitope: the residues the binder directly contacts. A
+    flank attracted to these competes with the binder for its binding site."""
     binder_interface_sequence: str = ""
     """The binder's own residues that contact the target. A flank attracted to
     these would compete with the target for the binder."""
@@ -343,6 +356,17 @@ class ProximalRegion:
     @property
     def labels(self) -> List[str]:
         return [r.label for r in self.residues]
+
+    @property
+    def epitope_overlap(self) -> List[int]:
+        """Selected residues that are also binder contacts.
+
+        Empty when ``exclude_epitope`` was on. Non-empty means the flank is
+        being aimed partly at the interface the binder already occupies.
+        """
+        contacts = {int(l.split(":")[1].rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                    for l in self.contact_labels}
+        return [s for s in self.seq_ids if s in contacts]
 
     @property
     def weights(self) -> np.ndarray:
@@ -493,7 +517,10 @@ class ProximalRegion:
             f"  residues selected   : {len(self.residues)}",
             f"  spans               : " + (self._span_text() or "none"),
             f"  patch sequence      : {self.patch_sequence or '(empty)'}",
-            f"  interface contacts  : {len(self.contact_labels)}",
+            f"  interface contacts  : {len(self.contact_labels)}"
+            + (f" ({len(self.epitope_overlap)} of them ALSO in the designed "
+               f"patch -- the flank may compete with the binder)"
+               if self.epitope_overlap else " (none in the designed patch)"),
             f"  binder interface    : {self.binder_interface_sequence or '(none)'}"
             f" ({len(self.binder_interface_labels)} residues; the flank must "
             f"not compete for these)",
@@ -671,8 +698,13 @@ def find_proximal_region(
     surface_threshold: float = 0.10,
     sasa_points: int = 480,
     trust_distal_occlusion: bool = False,
+    target_residues=None,
     exclude_target_residues=None,
     include_target_residues=None,
+    exclude_epitope: bool = True,
+    epitope_cutoff: Optional[float] = None,
+    dominant_epitope_only: bool = False,
+    report_patches: bool = True,
 ) -> ProximalRegion:
     """Select the target residues a new flank should be complementary to.
 
@@ -719,6 +751,42 @@ def find_proximal_region(
     sasa_points : int
         Test points per atom for the accessibility calculation. Lower is
         faster; the default is far more than surface classification needs.
+    dominant_epitope_only : bool
+        When the target presents several sequence-separated interface patches,
+        use only the one that buries the most surface (the dominant epitope) to
+        seed the design, ignoring the rest.
+
+        Off by default, deliberately. No signal reliably tells a prediction
+        artifact from a genuine discontinuous epitope: on a predicted structure
+        the spurious region is packed into van der Waals contact with the real
+        epitope, so it is spatially, compositionally and in buried area
+        indistinguishable from a real second lobe -- and this rule would drop a
+        genuine bipartite epitope's minor lobe. It reproduces a manual
+        ``target_residues`` fix for the common artifact case, but only when you
+        accept that trade-off. When off, the minor patches are flagged loudly
+        instead (see :attr:`report_patches`).
+    report_patches : bool
+        When several interface patches are present, append a ranked table
+        (buried area, contacts, anchor distance, and pLDDT for predicted
+        structures) to the notes and flag patches that look like artifacts,
+        with the exact ``target_residues`` remedy. On by default; purely
+        additive, changes no selection.
+    exclude_epitope : bool
+        Keep the target's own epitope -- the residues the binder is directly
+        contacting -- out of the designed patch. On by default.
+
+        A flank complementary to the epitope competes with the binder for it,
+        which is the mirror image of the flank competing with the target for the
+        binder. The accessibility filter only catches part of this: residues
+        *fully* buried by the binder drop out, but rim residues stay partially
+        exposed and would otherwise make up a quarter to a third of the patch.
+
+        Turn it off if you deliberately want to extend the existing interface
+        rather than add an adjacent one.
+    epitope_cutoff : float, optional
+        Distance from the binder, in angstroms, within which a target residue
+        counts as epitope. Defaults to ``contact_cutoff``. Raise it to leave a
+        buffer zone around the interface.
     exclude_target_residues : str or sequence, optional
         Target residues to remove from consideration entirely, in author
         numbering. See :func:`parse_residue_spec` for the accepted forms;
@@ -733,10 +801,13 @@ def find_proximal_region(
         Excluded residues take no part in locating the interface either, not
         just in the final selection -- otherwise the spurious patch would still
         define an accepted sequence window and let its neighbours through.
+    target_residues : str or sequence, optional
+        Use *only* this region of the target, in author numbering. Usually the
+        most direct way to say what you mean: ``target_residues=[245, 275]``
+        designs against residues 245-275 and nothing else. Same accepted forms
+        as ``exclude_target_residues``.
     include_target_residues : str or sequence, optional
-        The complement: consider *only* these target residues. Often the more
-        direct way to say the same thing, e.g. ``include_target_residues="400-"``
-        is expressed as ``(400, last_residue)``.
+        Alias for ``target_residues``. If both are given they are intersected.
     trust_distal_occlusion : bool
         Whether target residues that fail the sequence-locality test may still
         occlude solvent. Default ``False``: a predictor that drapes a distant
@@ -817,7 +888,16 @@ def find_proximal_region(
     # User-declared eligibility, applied BEFORE the interface is located: a
     # mispredicted region must not get to define an accepted sequence window.
     excluded_spec = parse_residue_spec(exclude_target_residues)
-    included_spec = parse_residue_spec(include_target_residues)
+    primary = parse_residue_spec(target_residues)
+    alias = parse_residue_spec(include_target_residues)
+    if primary and alias:
+        included_spec = primary & alias
+        if not included_spec:
+            raise InterfaceError(
+                "target_residues and include_target_residues do not overlap, "
+                "so nothing is selectable. Give one or the other.")
+    else:
+        included_spec = primary or alias
 
     def eligible(seq_id: int) -> bool:
         if included_spec and seq_id not in included_spec:
@@ -830,7 +910,7 @@ def find_proximal_region(
             missing = included_spec - present
             if len(missing) == len(included_spec):
                 raise InterfaceError(
-                    f"include_target_residues selects "
+                    f"target_residues selects "
                     f"{_describe_residue_set(included_spec)}, but chain "
                     f"{target_chain!r} contains none of those residue numbers "
                     f"(it spans {target[0].seq_id}-{target[-1].seq_id}).")
@@ -851,7 +931,7 @@ def find_proximal_region(
         dtype=np.int64)
     if contact_idx.size == 0:
         raise InterfaceError(
-            f"after applying exclude_target_residues/include_target_residues, "
+            f"after applying target_residues/exclude_target_residues, "
             f"no contact between chains {binder_chain!r} and {target_chain!r} "
             f"remains. The eligible region does not touch the binder -- check "
             f"the numbering, or widen the selection."
@@ -873,11 +953,42 @@ def find_proximal_region(
             f"noise: "
             + ", ".join(f"{c[0]}-{c[-1]} ({len(c)})" for c in dropped[:5])
         )
+    # Rank the kept patches by buried surface area so the dominant epitope can
+    # be identified, an optional dominant-only restriction applied, and the
+    # minor patches flagged. BSA needs no anchor, so it is available here.
+    patch_stats = None
     if len(kept) > 1:
-        notes.append(
-            f"target presents {len(kept)} distinct interface patches: "
-            + ", ".join(f"{c[0]}-{c[-1]}" for c in kept)
-        )
+        iso = residue_sasa(target.residues, n_points=sasa_points)
+        cpx = residue_sasa(
+            target.residues,
+            context=[res for cid, chain in structure.chains.items()
+                     if cid != target_chain for res in chain.residues],
+            n_points=sasa_points)
+        bsa_by_id = {target.residues[i].seq_id: float(iso[i] - cpx[i])
+                     for i in range(len(target))}
+        n_contact_by_id: Dict[int, int] = {}
+        for i in contact_idx:
+            sid = int(target[i].seq_id)
+            n_contact_by_id[sid] = n_contact_by_id.get(sid, 0) + 1
+        patch_stats = []
+        for c in kept:
+            patch_stats.append({
+                "cluster": c,
+                "label": f"{c[0]}-{c[-1]}",
+                "contacts": len(c),
+                "bsa": sum(bsa_by_id.get(r, 0.0) for r in c),
+            })
+        patch_stats.sort(key=lambda p: -p["bsa"])
+        dominant = patch_stats[0]
+
+        if dominant_epitope_only:
+            kept = [dominant["cluster"]]
+            notes.append(
+                f"restricted to the dominant interface patch "
+                f"{dominant['label']} ({dominant['bsa']:.0f} A^2 buried, "
+                f"{dominant['contacts']} contacts); {len(patch_stats) - 1} "
+                f"other patch(es) ignored as requested "
+                f"(dominant_epitope_only=True).")
 
     allowed_windows = [(c[0] - sequence_window, c[-1] + sequence_window)
                        for c in kept]
@@ -901,6 +1012,73 @@ def find_proximal_region(
 
     d_anchor = min_distances_to(target, anchor_coords)
 
+    # Ranked patch report + artifact flag. Purely additive: it never changes the
+    # selection, it only tells the user which patches to trust. No signal (BSA,
+    # contacts, pLDDT, 3D contiguity) reliably separates an artifact from a
+    # genuine discontinuous epitope, so this reports rather than filters.
+    if report_patches and patch_stats is not None and len(patch_stats) > 1:
+        anchor_by_id = {target.residues[i].seq_id: float(d_anchor[i])
+                        for i in range(len(target))}
+        show_plddt = getattr(structure, "plddt_from_bfactor", False)
+        plddt_by_id = {}
+        if show_plddt:
+            for res in target.residues:
+                bs = [a.bfactor for a in res.atoms]
+                if bs:
+                    plddt_by_id[res.seq_id] = float(np.mean(bs))
+        dom = patch_stats[0]
+        dom_anchor = min(anchor_by_id.get(r, np.inf) for r in dom["cluster"])
+        for p in patch_stats:
+            p["anchor"] = min(anchor_by_id.get(r, np.inf) for r in p["cluster"])
+            p["plddt"] = (np.mean([plddt_by_id[r] for r in p["cluster"]
+                                   if r in plddt_by_id])
+                          if show_plddt and any(r in plddt_by_id
+                                                for r in p["cluster"])
+                          else None)
+            p["dominant"] = p is dom
+            p["artifact"] = (
+                p is not dom
+                and p["bsa"] < _ARTIFACT_BSA_FRACTION * dom["bsa"]
+                and dom_anchor > 0
+                and p["anchor"] > _ARTIFACT_ANCHOR_MULTIPLE * dom_anchor)
+
+        header = "  patch        %BSA contacts anchor_A"
+        if show_plddt:
+            header += " pLDDT"
+        rows = [header]
+        for p in patch_stats:
+            frac = 100.0 * p["bsa"] / dom["bsa"] if dom["bsa"] else 0.0
+            row = (f"  {p['label']:>10s} {frac:5.0f}% {p['contacts']:8d} "
+                   f"{p['anchor']:8.1f}")
+            if show_plddt:
+                row += f" {p['plddt']:5.0f}" if p["plddt"] is not None else "    -"
+            if p["dominant"]:
+                row += "  <-- dominant epitope"
+            elif p["artifact"]:
+                row += "  likely prediction artifact"
+            rows.append(row)
+        notes.append("interface patches (ranked by buried area):\n"
+                     + "\n".join(rows))
+
+        flagged = [p for p in patch_stats if p["artifact"]]
+        if flagged:
+            lo = dom["cluster"][0] - sequence_window
+            hi = dom["cluster"][-1] + sequence_window
+            predicted = (" On a predicted structure this is the signature of a "
+                         "spurious region docked onto the binder."
+                         if show_plddt else "")
+            notes.append(
+                f"{len(flagged)} interface patch(es) "
+                f"({', '.join(p['label'] for p in flagged)}) are minor (< "
+                f"{int(_ARTIFACT_BSA_FRACTION * 100)}% of the dominant "
+                f"{dom['label']} epitope's buried area) and sit far from the "
+                f"attachment point, unlike the dominant epitope at the anchor."
+                f"{predicted} If they are prediction artifacts rather than real "
+                f"secondary sites, pass target_residues=[{lo}, {hi}] to design "
+                f"against the dominant epitope only, or "
+                f"exclude_target_residues=\""
+                + ",".join(p['label'] for p in flagged) + "\".")
+
     # --- 3. reachable from the anchor ---
     if radius is not None:
         r = float(radius)
@@ -923,9 +1101,19 @@ def find_proximal_region(
     # surface it was spuriously placed on top of.
     candidate_idx: List[int] = []
     excluded: List[str] = []
+    # The epitope still locates the interface above; it is only barred from the
+    # selection here. Removing it earlier would destroy the sequence window the
+    # whole anchor logic depends on.
+    epitope_limit = (float(contact_cutoff) if epitope_cutoff is None
+                     else float(epitope_cutoff))
+
     n_ineligible = 0
+    n_epitope = 0
     for i, res in enumerate(target.residues):
         if not np.isfinite(d_anchor[i]) or d_anchor[i] > r:
+            continue
+        if exclude_epitope and d_binder[i] <= epitope_limit:
+            n_epitope += 1
             continue
         if not eligible(int(res.seq_id)):
             n_ineligible += 1
@@ -934,6 +1122,14 @@ def find_proximal_region(
             candidate_idx.append(i)
         else:
             excluded.append(res.label)
+
+    if n_epitope:
+        notes.append(
+            f"{n_epitope} residue(s) within reach are part of the target's own "
+            f"epitope (within {epitope_limit:.1f} A of the binder) and were "
+            f"excluded so the flank does not compete with the binder for them. "
+            f"Pass exclude_epitope=False to design against the interface "
+            f"itself.")
 
     if n_ineligible:
         notes.append(
@@ -1039,6 +1235,12 @@ def find_proximal_region(
             f"{sequence_window} residues of the interface. The flank probably "
             f"cannot reach the interface from this terminus -- try the other "
             f"terminus, a longer flank, or a larger radius."
+            + (f" Note that {n_epitope} reachable residue(s) were the target's "
+               f"own epitope and were excluded; if essentially all reachable "
+               f"surface is epitope there is no adjacent surface to add to, "
+               f"which is itself the answer. Pass exclude_epitope=False to "
+               f"design against the interface instead."
+               if n_epitope else "")
         )
 
     # Unresolved residues in the TARGET matter too: whatever they would have
@@ -1058,6 +1260,23 @@ def find_proximal_region(
                 + "). Surface those missing residues would have covered reads "
                   "as exposed here, so some selected residues may not really "
                   "be accessible in the intact protein.")
+
+    # When a region was requested, say how much of it actually survived. The
+    # selection is a ceiling, not a forced set -- reach, surface accessibility
+    # and the epitope guard still apply within it -- and that intersection is
+    # the easiest thing to misread.
+    if included_spec:
+        present_requested = included_spec & {int(r.seq_id)
+                                             for r in target.residues}
+        kept_requested = {p.seq_id for p in selected} & present_requested
+        if len(kept_requested) != len(present_requested):
+            lost = present_requested - kept_requested
+            notes.append(
+                f"{len(kept_requested)} of the {len(present_requested)} "
+                f"requested residues present in this chain survived the other "
+                f"filters (reach, surface accessibility, epitope); dropped "
+                f"{_describe_residue_set(lost)}. The selection is a ceiling, "
+                f"not a forced set.")
 
     if len(selected) < 5:
         notes.append(
@@ -1090,6 +1309,7 @@ def find_proximal_region(
         anchor_label=anchor_label,
         reach_radius=r,
         contact_labels=[target[i].label for i in contact_idx],
+        epitope_sequence="".join(target[i].one_letter for i in contact_idx),
         excluded_labels=excluded,
         binder_interface_sequence="".join(r.one_letter for r in binder_iface),
         binder_interface_labels=[r.label for r in binder_iface],

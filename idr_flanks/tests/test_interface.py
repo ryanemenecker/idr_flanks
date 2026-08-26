@@ -469,7 +469,8 @@ class TestInsertionCodes:
         return find_proximal_region(struct, "B", "A", "N", 20,
                                     require_surface=False,
                                     min_cluster_contacts=2,
-                                    sequence_window=50)
+                                    sequence_window=50,
+                                    exclude_epitope=False)
 
     def test_all_four_residues_selected(self, region):
         assert region.labels == ["A:52", "A:52A", "A:52B", "A:53"]
@@ -544,7 +545,7 @@ class TestSequenceLocalityFilter:
         """The default min_cluster_contacts rejects the 2-residue artifact."""
         struct = read_pdb(_write(tmp_path, "artifact.pdb", self.PDB))
         region = find_proximal_region(
-            struct, "B", "A", "N", 20,
+            struct, "B", "A", "N", 20, exclude_epitope=False,
             require_surface=False, sequence_window=25, cluster_gap=15)
         assert set(region.seq_ids) <= {10, 11, 12, 13}
         assert 200 not in region.seq_ids and 201 not in region.seq_ids
@@ -555,7 +556,7 @@ class TestSequenceLocalityFilter:
     def test_small_patch_reported_as_discarded(self, tmp_path):
         struct = read_pdb(_write(tmp_path, "artifact_note.pdb", self.PDB))
         region = find_proximal_region(
-            struct, "B", "A", "N", 20,
+            struct, "B", "A", "N", 20, exclude_epitope=False,
             require_surface=False, cluster_gap=15)
         assert any("noise" in n for n in region.notes)
 
@@ -563,7 +564,7 @@ class TestSequenceLocalityFilter:
         """Opting in to 2-residue patches keeps the sequence-distant pair."""
         struct = read_pdb(_write(tmp_path, "artifact2.pdb", self.PDB))
         region = find_proximal_region(
-            struct, "B", "A", "N", 20,
+            struct, "B", "A", "N", 20, exclude_epitope=False,
             require_surface=False, sequence_window=25, cluster_gap=15,
             min_cluster_contacts=2)
         assert 200 in region.seq_ids
@@ -572,7 +573,7 @@ class TestSequenceLocalityFilter:
         """A window wide enough to span the gap also admits it."""
         struct = read_pdb(_write(tmp_path, "artifact3.pdb", self.PDB))
         region = find_proximal_region(
-            struct, "B", "A", "N", 20,
+            struct, "B", "A", "N", 20, exclude_epitope=False,
             require_surface=False, sequence_window=300, cluster_gap=15)
         assert 200 in region.seq_ids
 
@@ -580,14 +581,18 @@ class TestSequenceLocalityFilter:
         """With no gap-based split there is one patch, big enough to keep."""
         struct = read_pdb(_write(tmp_path, "artifact4.pdb", self.PDB))
         region = find_proximal_region(
-            struct, "B", "A", "N", 20,
+            struct, "B", "A", "N", 20, exclude_epitope=False,
             require_surface=False, sequence_window=25, cluster_gap=500)
         assert 200 in region.seq_ids
 
     def test_multiple_patches_are_reported(self, ycr):
-        # 1YCR's interface genuinely comes in two sequence-separated patches.
+        # 1YCR's interface genuinely comes in two sequence-separated patches,
+        # now surfaced as a ranked table.
         region = find_proximal_region(ycr, "B", "A", "C", 20)
-        assert any("distinct interface patches" in n for n in region.notes)
+        table = next((n for n in region.notes
+                      if "ranked by buried area" in n), None)
+        assert table is not None
+        assert "50-75" in table and "91-104" in table
 
 
 class TestTargetChainBreaks:
@@ -713,6 +718,135 @@ class TestFormatAgnostic:
         assert rp.patch_sequence == rc.patch_sequence
 
 
+class TestPatchRanking:
+    """Multiple interface patches get a ranked, flagged report. No signal safely
+    separates a predicted-structure artifact from a genuine discontinuous
+    epitope, so this reports rather than filters."""
+
+    USER = ("idr_flanks/data/structures/"
+            "test_binder_chain_A_target_chain_B.cif")
+
+    def test_ranked_report_on_the_user_structure(self):
+        s = read_structure(self.USER)
+        region = find_proximal_region(s, "A", "B", "N", 30)
+        table = next((n for n in region.notes
+                      if "ranked by buried area" in n), None)
+        assert table is not None
+        assert "280-298" in table and "dominant epitope" in table
+        assert "likely prediction artifact" in table
+
+    def test_artifacts_are_flagged_with_a_remedy(self):
+        s = read_structure(self.USER)
+        region = find_proximal_region(s, "A", "B", "N", 30)
+        remedy = next((n for n in region.notes if "target_residues" in n), None)
+        assert remedy is not None
+        assert "26-32, 63-71, 97-101" in remedy
+        assert "target_residues=[255, 323]" in remedy
+
+    def test_plddt_column_only_for_predicted_structures(self):
+        s = read_structure(self.USER)
+        assert s.plddt_from_bfactor
+        table = next(n for n in find_proximal_region(s, "A", "B", "N", 30).notes
+                     if "ranked by buried area" in n)
+        assert "pLDDT" in table
+
+    def test_report_does_not_change_selection(self):
+        s = read_structure(self.USER)
+        a = find_proximal_region(s, "A", "B", "N", 30, report_patches=True)
+        b = find_proximal_region(s, "A", "B", "N", 30, report_patches=False)
+        assert a.seq_ids == b.seq_ids
+
+    def test_genuine_two_patch_epitope_is_not_flagged(self, ycr):
+        """1YCR's second MDM2 cleft patch is real (68% of the dominant area,
+        at the anchor) and must not be called an artifact."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert not any("prediction artifact" in n for n in region.notes)
+        table = next((n for n in region.notes
+                      if "ranked by buried area" in n), None)
+        assert table is not None
+        assert "91-104" in table
+
+    def test_crystal_structure_has_no_plddt_column(self, ycr):
+        table = next((n for n in find_proximal_region(ycr, "B", "A", "C", 25).notes
+                      if "ranked by buried area" in n), None)
+        assert table is not None
+        assert "pLDDT" not in table
+
+    def test_single_interface_gets_no_ranked_report(self, ycr):
+        """With one surviving patch there is nothing to rank."""
+        # 50-75 has 14 contacts, 91-104 has 8; threshold 9 drops the latter.
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      min_cluster_contacts=9)
+        assert not any("ranked by buried area" in n for n in region.notes)
+        assert not any("prediction artifact" in n for n in region.notes)
+
+    def test_dominant_epitope_only_reproduces_the_manual_fix(self):
+        s = read_structure(self.USER)
+        region = find_proximal_region(s, "A", "B", "N", 30,
+                                      dominant_epitope_only=True)
+        assert all(255 <= r <= 323 for r in region.seq_ids)
+        assert not any(r <= 101 for r in region.seq_ids)
+        assert any("restricted to the dominant" in n for n in region.notes)
+
+    def test_dominant_only_is_off_by_default(self, ycr):
+        default = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert not any("restricted to the dominant" in n
+                       for n in default.notes)
+
+
+class TestEpitopeExclusion:
+    """The target's own epitope -- the residues the binder contacts -- must not
+    be what the flank is aimed at, or the flank competes with the binder for
+    its own site."""
+
+    def test_excluded_by_default(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert region.epitope_overlap == []
+
+    def test_included_when_asked(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      exclude_epitope=False)
+        # 26-35% of the patch was epitope before the guard existed
+        assert len(region.epitope_overlap) >= 8
+
+    def test_exclusion_shrinks_the_patch(self, ycr):
+        guarded = find_proximal_region(ycr, "B", "A", "C", 25)
+        unguarded = find_proximal_region(ycr, "B", "A", "C", 25,
+                                         exclude_epitope=False)
+        assert len(guarded) < len(unguarded)
+
+    def test_buffer_widens_the_exclusion(self, ycr):
+        near = find_proximal_region(ycr, "B", "A", "C", 25)
+        buffered = find_proximal_region(ycr, "B", "A", "C", 25,
+                                        epitope_cutoff=8.0)
+        assert len(buffered) < len(near)
+
+    def test_epitope_still_locates_the_interface(self, ycr):
+        """It is excluded from the selection only. Removing it earlier would
+        destroy the sequence window the anchor logic depends on."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert len(region.contact_labels) == 24
+        assert region.epitope_sequence
+        assert len(region) > 0
+
+    def test_epitope_sequence_matches_the_contacts(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert len(region.epitope_sequence) == len(region.contact_labels)
+
+    def test_exclusion_is_reported(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert any("own epitope" in n for n in region.notes)
+
+    def test_summary_flags_overlap_when_unguarded(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      exclude_epitope=False)
+        assert "ALSO in the designed patch" in region.summary()
+
+    def test_summary_is_clean_when_guarded(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25)
+        assert "none in the designed patch" in region.summary()
+
+
 class TestResidueSpecParsing:
     """The selection syntax, including the one deliberately ambiguous case."""
 
@@ -808,44 +942,112 @@ class TestTargetResidueSelection:
         return read_pdb(str(p))
 
     def test_the_failure_reproduces_without_help(self, mispredicted):
-        """Both patches survive: the automatic filters cannot fix this."""
-        region = find_proximal_region(mispredicted, "B", "A", "C", 25)
+        """Both patches survive: the automatic filters cannot remove this, they
+        can only report it (this fixture is a crystal-style file, so no pLDDT).
+        """
+        region = find_proximal_region(mispredicted, "B", "A", "C", 25,
+                                      exclude_epitope=False)
         assert set("KE") <= set(region.patch_sequence)
         assert any(a <= 100 for a, _ in region.spans)
-        assert any("2 distinct interface patches" in n for n in region.notes)
+        assert any("ranked by buried area" in n for n in region.notes)
 
     def test_exclusion_removes_the_mispredicted_region(self, mispredicted):
         region = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                      exclude_target_residues=[1, 100])
+                                      exclude_target_residues=[1, 100],
+                                      exclude_epitope=False)
         assert set(region.patch_sequence) == {"E"}
         assert region.spans == [(480, 495)]
         assert all(s >= 480 for s in region.seq_ids)
 
+    def test_target_residues_selects_a_region_directly(self, ycr):
+        """The plain way to say 'use this region'."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      target_residues=[96, 109])
+        assert region.seq_ids
+        assert all(96 <= s <= 109 for s in region.seq_ids)
+
+    def test_target_residues_is_a_ceiling_not_a_forced_set(self, ycr):
+        """The other filters still apply within the requested region, and how
+        much survived is reported -- the easiest thing to misread."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      target_residues=[96, 109])
+        assert set(region.seq_ids) < set(range(96, 110))
+        assert any("survived the other filters" in n for n in region.notes)
+
+    def test_all_requested_residues_kept_when_nothing_filters_them(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      target_residues=[96, 109],
+                                      exclude_epitope=False)
+        assert set(region.seq_ids) == set(range(96, 110))
+        assert not any("survived the other filters" in n for n in region.notes)
+
+    def test_requested_region_gates_interface_identification(self, ycr):
+        """Not just the final selection: a contact outside the region must not
+        be able to define an accepted sequence window."""
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      target_residues=[96, 109])
+        # the 50-75 patch is a real interface patch but lies outside the region
+        assert not any("50-75" in n for n in region.notes)
+        assert all(96 <= s <= 109 for s in region.seq_ids)
+
+    def test_target_residues_accepts_the_string_form(self, ycr):
+        a = find_proximal_region(ycr, "B", "A", "C", 25,
+                                 target_residues=[96, 109])
+        b = find_proximal_region(ycr, "B", "A", "C", 25,
+                                 target_residues="96-109")
+        assert a.seq_ids == b.seq_ids
+
+    def test_include_target_residues_is_an_alias(self, ycr):
+        a = find_proximal_region(ycr, "B", "A", "C", 25,
+                                 target_residues=[96, 109])
+        b = find_proximal_region(ycr, "B", "A", "C", 25,
+                                 include_target_residues=[96, 109])
+        assert a.seq_ids == b.seq_ids
+
+    def test_target_and_exclude_combine(self, ycr):
+        region = find_proximal_region(ycr, "B", "A", "C", 25,
+                                      target_residues="96-109",
+                                      exclude_target_residues="105-109")
+        assert region.seq_ids
+        assert all(96 <= s <= 104 for s in region.seq_ids)
+
+    def test_disjoint_selections_error(self, ycr):
+        with pytest.raises(InterfaceError, match="do not overlap"):
+            find_proximal_region(ycr, "B", "A", "C", 25,
+                                 target_residues="96-109",
+                                 include_target_residues="25-30")
+
     def test_inclusion_is_equivalent_here(self, mispredicted):
         excluded = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                        exclude_target_residues="1-100")
+                                        exclude_target_residues="1-100",
+                                        exclude_epitope=False)
         included = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                        include_target_residues=[480, 495])
+                                        target_residues=[480, 495],
+                                        exclude_epitope=False)
         assert excluded.seq_ids == included.seq_ids
 
     def test_string_and_list_forms_agree(self, mispredicted):
         a = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                 exclude_target_residues="1-100")
+                                 exclude_target_residues="1-100",
+                                 exclude_epitope=False)
         b = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                 exclude_target_residues=[1, 100])
+                                 exclude_target_residues=[1, 100],
+                                 exclude_epitope=False)
         assert a.seq_ids == b.seq_ids
 
     def test_excluded_region_cannot_define_an_interface_patch(self, mispredicted):
         """The filter must run before clustering, or the excluded patch still
         opens a sequence window for its neighbours."""
         region = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                      exclude_target_residues=[1, 100])
+                                      exclude_target_residues=[1, 100],
+                                      exclude_epitope=False)
         assert not any("2 distinct interface patches" in n
                        for n in region.notes)
 
     def test_selection_is_reported(self, mispredicted):
         region = find_proximal_region(mispredicted, "B", "A", "C", 25,
-                                      exclude_target_residues=[1, 100])
+                                      exclude_target_residues=[1, 100],
+                                      exclude_epitope=False)
         assert any("excluded target residues 1-100" in n for n in region.notes)
         assert any("ruled out by the target-residue selection" in n
                    for n in region.notes)
@@ -938,7 +1140,7 @@ class TestDistalOcclusion:
         return find_proximal_region(
             struct, "B", "A", "N", self.FLANK, trust_distal_occlusion=trust,
             min_cluster_contacts=2, sequence_window=25,
-            surface_threshold=threshold)
+            surface_threshold=threshold, exclude_epitope=False)
 
     def test_distal_region_does_not_bury_local_surface(self, draped):
         keep = self._region(draped, trust=False)
@@ -953,7 +1155,8 @@ class TestDistalOcclusion:
         default = find_proximal_region(draped, "B", "A", "N", self.FLANK,
                                        min_cluster_contacts=2,
                                        sequence_window=25,
-                                       surface_threshold=0.30)
+                                       surface_threshold=0.30,
+                                       exclude_epitope=False)
         assert set(default.seq_ids) == set(range(50, 57))
 
     def test_exclusion_is_reported(self, draped):
@@ -988,7 +1191,8 @@ class TestDistalOcclusion:
         p.write_text("".join(lines) + "END\n")
         region = find_proximal_region(read_pdb(str(p)), "B", "A", "N",
                                       self.FLANK, min_cluster_contacts=2,
-                                      sequence_window=25)
+                                      sequence_window=25,
+                                      exclude_epitope=False)
         assert not any("sequence-distant" in n and "accessibility" in n
                        for n in region.notes)
 

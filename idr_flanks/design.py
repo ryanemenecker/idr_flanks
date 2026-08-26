@@ -38,6 +38,8 @@ __all__ = [
     "target_discriminability",
     "shell_epsilon_class",
     "shell_weighted_epsilon",
+    "flank_epsilons",
+    "FlankEpsilonScores",
     "idr_amino_acid_frequencies",
     "context_disorder_class",
     "binder_competition_class",
@@ -398,6 +400,112 @@ def shell_weighted_epsilon(sequence: str, shells, model: str = "mpipi") -> float
                  / total) / len(sequence)
 
 
+
+@dataclass
+class FlankEpsilonScores:
+    """Per-residue interaction epsilon of a flank against the design references.
+
+    Negative epsilon is attractive. Each value is ``NaN`` when its reference was
+    not supplied. The reference sequences that were actually scored against are
+    kept so the numbers are self-explanatory.
+    """
+
+    sequence: str
+    patch_sequence: str = ""
+    epitope_sequence: str = ""
+    binder_interface_sequence: str = ""
+    epsilon_vs_patch: float = float("nan")
+    epsilon_vs_patch_reach_weighted: float = float("nan")
+    epsilon_vs_epitope: float = float("nan")
+    epsilon_vs_binder_interface: float = float("nan")
+    model: str = "mpipi"
+
+    @property
+    def target_epsilon(self) -> float:
+        """Attraction to the target: the reach-weighted value when a shell
+        breakdown was supplied, else the flat-patch value."""
+        w = self.epsilon_vs_patch_reach_weighted
+        return w if w == w else self.epsilon_vs_patch
+
+    @property
+    def target_preference(self) -> float:
+        """How much more the flank prefers the target than the binder's own
+        interface (positive is good). ``NaN`` if either was not scored."""
+        return self.epsilon_vs_binder_interface - self.target_epsilon
+
+    def summary(self) -> str:
+        def line(label, value):
+            return (f"  {label:<24s}: {value:+.3f} per residue"
+                    if value == value else f"  {label:<24s}: (not scored)")
+        out = [f"Flank epsilon scores ({len(self.sequence)} residues, "
+               f"model {self.model}; negative is attractive)",
+               f"  sequence                : {self.sequence}",
+               line("vs target patch", self.epsilon_vs_patch)]
+        if self.epsilon_vs_patch_reach_weighted == self.epsilon_vs_patch_reach_weighted:
+            out.append(line("vs patch (reach-wtd)",
+                            self.epsilon_vs_patch_reach_weighted))
+        out.append(line("vs target epitope", self.epsilon_vs_epitope))
+        out.append(line("vs binder interface", self.epsilon_vs_binder_interface))
+        if self.target_preference == self.target_preference:
+            out.append(line("prefers target by", self.target_preference))
+        return "\n".join(out)
+
+
+def flank_epsilons(sequence: str, *,
+                   patch: str = "",
+                   epitope: str = "",
+                   binder_interface: str = "",
+                   shells: "Optional[Sequence]" = None,
+                   model: str = "mpipi") -> FlankEpsilonScores:
+    """Score one flank against whatever references you have.
+
+    A pure calculation -- no structure needed. Pass any subset of the target
+    patch, the target epitope, and the binder interface (all in one-letter
+    code); each missing reference is left as ``NaN``. This is the retrospective
+    counterpart of what a design run reports, so the numbers match a
+    :class:`DesignResult`'s ``epsilon_vs_*`` fields exactly.
+
+    Parameters
+    ----------
+    sequence : str
+        The flank sequence to score.
+    patch : str
+        Concatenated target residues the flank was meant to complement.
+    epitope : str
+        The target's own binder-contacting residues.
+    binder_interface : str
+        The binder's own target-contacting residues.
+    shells : sequence of (str, float), optional
+        Reach-weighted shells (from
+        :meth:`~idr_flanks.interface.ProximalRegion.weighted_shells`); when
+        given, the reach-weighted patch epsilon is also reported.
+    model : str
+        Epsilon model, ``"mpipi"`` or ``"calvados"``.
+
+    Returns
+    -------
+    FlankEpsilonScores
+    """
+    if not sequence:
+        raise ValueError("sequence must be non-empty")
+    nan = float("nan")
+    return FlankEpsilonScores(
+        sequence=sequence,
+        patch_sequence=patch,
+        epitope_sequence=epitope,
+        binder_interface_sequence=binder_interface,
+        epsilon_vs_patch=(epsilon_per_residue(sequence, patch, model)
+                          if patch else nan),
+        epsilon_vs_patch_reach_weighted=(
+            shell_weighted_epsilon(sequence, shells, model) if shells else nan),
+        epsilon_vs_epitope=(epsilon_per_residue(sequence, epitope, model)
+                            if epitope else nan),
+        epsilon_vs_binder_interface=(
+            epsilon_per_residue(sequence, binder_interface, model)
+            if binder_interface else nan),
+        model=model,
+    )
+
 def _make_competition_class():
     """Build the BinderCompetition property against GOOSE's base class."""
     from goose.backend.optimizer_properties import ConstraintType, CustomProperty
@@ -420,10 +528,20 @@ def _make_competition_class():
         calculate_in_batch = False
 
         def __init__(self, binder_interface: str, target_patch: str, model,
+                     target_shells=None,
                      target_value: float = 0.0, weight: float = 1.0,
                      constraint_type=ConstraintType.MINIMUM):
             self.binder_interface = binder_interface
             self.target_patch = target_patch
+            # When the attraction objective is reach-weighted, the comparison
+            # must be against the same quantity, or the guard protects a
+            # different target than the one being optimised.
+            self.target_shells = ([(str(s), float(w)) for s, w in target_shells]
+                                  if target_shells else None)
+            self._norm = (sum(w for _, w in self.target_shells)
+                          if self.target_shells else 0.0)
+            if self.target_shells and self._norm <= 0:
+                raise ValueError("target_shells weights must be positive")
             self._model = model
             super().__init__(target_value=target_value, weight=weight,
                              constraint_type=constraint_type)
@@ -432,14 +550,21 @@ def _make_competition_class():
             args = super().get_init_args()
             args.update({"binder_interface": self.binder_interface,
                          "target_patch": self.target_patch,
+                         "target_shells": self.target_shells,
                          "model": self._model})
             return args
 
+        def _target_epsilon(self, seq: str) -> float:
+            eps = self._model.epsilon
+            if self.target_shells:
+                return float(sum(w * eps(seq, s)
+                                 for s, w in self.target_shells) / self._norm)
+            return float(eps(seq, self.target_patch))
+
         def calculate_raw_value(self, protein) -> float:
             seq = protein.sequence
-            eps = self._model.epsilon
-            return float(eps(seq, self.binder_interface)
-                         - eps(seq, self.target_patch))
+            return float(self._model.epsilon(seq, self.binder_interface)
+                         - self._target_epsilon(seq))
 
     return BinderCompetition
 
@@ -777,6 +902,10 @@ class DesignResult:
     reference_epsilon_sd: float = float("nan")
     binder_interface_sequence: str = ""
     epsilon_vs_binder_interface: float = float("nan")
+    epitope_sequence: str = ""
+    epsilon_vs_epitope: float = float("nan")
+    """Attraction to the target's own epitope. Negative means the flank is
+    drawn to the surface the binder already occupies."""
     complexity: float = float("nan")
     selected_patch_sequence: str = ""
     """The target region as selected, when :attr:`patch_sequence` contains
@@ -788,14 +917,25 @@ class DesignResult:
         return self.sequence
 
     @property
+    def target_epsilon(self) -> float:
+        """Whatever the objective actually optimised: the reach-weighted
+        epsilon when shells were used, else the flat-patch epsilon."""
+        return (self.epsilon_weighted
+                if self.epsilon_weighted == self.epsilon_weighted
+                else self.epsilon_per_residue)
+
+    @property
     def target_preference(self) -> float:
         """How much more the flank likes the target than the binder interface.
 
         Positive means the flank adds affinity; zero or negative means it
         competes with the target for the binder. This, not the raw sign of
         :attr:`epsilon_vs_binder_interface`, is the criterion that matters.
+
+        Compared against :attr:`target_epsilon`, so the guard is measured
+        against the same quantity the objective optimised.
         """
-        return self.epsilon_vs_binder_interface - self.epsilon_per_residue
+        return self.epsilon_vs_binder_interface - self.target_epsilon
 
     def summary(self) -> str:
         lines = [
@@ -822,6 +962,14 @@ class DesignResult:
             f"({'self-attractive, aggregation risk' if self.self_epsilon_per_residue < 0 else 'self-repulsive, soluble'})",
             f"  fraction disordered    : {self.fraction_disorder:.2f} alone, "
             f"{self.fraction_disorder_in_context:.2f} fused to the binder",
+            *( [f"  vs target epitope      : "
+                f"{self.epsilon_vs_epitope:+.3f} per residue"
+                + (f" -- MORE attractive than the intended patch "
+                   f"({self.epsilon_per_residue:+.3f}); the flank may compete "
+                   f"with the binder for its own site"
+                   if self.epsilon_vs_epitope < self.epsilon_per_residue
+                   else "")]
+               if self.epsilon_vs_epitope == self.epsilon_vs_epitope else [] ),
             *( [f"  vs binder interface    : "
                 f"{self.epsilon_vs_binder_interface:+.3f} per residue; "
                 f"prefers the target by {self.target_preference:+.3f} "
@@ -891,7 +1039,8 @@ _DISCRIMINATION_PROBES = (
 
 def target_discriminability(target_patch: str, binder_interface: str,
                             model: str = "mpipi",
-                            probe_length: int = 25) -> float:
+                            probe_length: int = 25,
+                            target_shells=None) -> float:
     """Best per-residue preference for the target over the binder achievable.
 
     A flank can only avoid competing with the target if some chemistry is more
@@ -917,6 +1066,10 @@ def target_discriminability(target_patch: str, binder_interface: str,
         Epsilon model name.
     probe_length : int
         Length of the probe sequences.
+    target_shells : sequence of (str, float), optional
+        Reach-weighted shells. When given, the target side is the weighted
+        average over these rather than the flat patch, matching what the
+        objective optimises.
 
     Returns
     -------
@@ -927,11 +1080,19 @@ def target_discriminability(target_patch: str, binder_interface: str,
     if not target_patch or not binder_interface:
         return float("inf")
     mf = load_epsilon_model(model)
+    norm = sum(w for _, w in target_shells) if target_shells else 0.0
+
+    def target_eps(probe: str) -> float:
+        if target_shells and norm > 0:
+            return sum(w * mf.epsilon(probe, s)
+                       for s, w in target_shells) / norm
+        return float(mf.epsilon(probe, target_patch))
+
     best = -float("inf")
     for aa in _DISCRIMINATION_PROBES:
         probe = aa * probe_length
         gap = (float(mf.epsilon(probe, binder_interface))
-               - float(mf.epsilon(probe, target_patch))) / probe_length
+               - target_eps(probe)) / probe_length
         best = max(best, gap)
     return best
 
@@ -948,6 +1109,7 @@ def _neutral_reference(length: int, seed: int = 0) -> str:
 def score_flank(sequence: str, patch_sequence: str,
                 n_context: str = "", c_context: str = "",
                 binder_interface: str = "",
+                epitope: str = "",
                 shells: Optional[Sequence] = None,
                 model: str = "mpipi",
                 disorder_cutoff: float = 0.5,
@@ -1019,6 +1181,9 @@ def score_flank(sequence: str, patch_sequence: str,
         out["epsilon_vs_binder_interface"] = float(
             mf.epsilon(sequence, binder_interface)) / L
 
+    if epitope:
+        out["epsilon_vs_epitope"] = float(mf.epsilon(sequence, epitope)) / L
+
     if shells:
         total = sum(w for _, w in shells)
         if total > 0:
@@ -1080,6 +1245,7 @@ def design_flank(patch_sequence: str,
                  c_context: str = "",
                  selected_patch: Optional[str] = None,
                  binder_interface: str = "",
+                 epitope: str = "",
                  shells: Optional[Sequence] = None,
                  preset: Optional[str] = None,
                  config: Optional[DesignConfig] = None,
@@ -1093,7 +1259,7 @@ def design_flank(patch_sequence: str,
                                 c_context=c_context,
                                 selected_patch=selected_patch,
                                 binder_interface=binder_interface,
-                                shells=shells, config=cfg)
+                                epitope=epitope, shells=shells, config=cfg)
 
     # Retrying only helps if a disorder term is actually in play. Without any
     # sequence context the in-context number equals the isolated one, and a
@@ -1110,7 +1276,8 @@ def design_flank(patch_sequence: str,
                                    c_context=c_context,
                                    selected_patch=selected_patch,
                                    binder_interface=binder_interface,
-                                   shells=shells, config=retry_cfg)
+                                   epitope=epitope, shells=shells,
+                                   config=retry_cfg)
         better = (retry if retry.fraction_disorder_in_context
                   > result.fraction_disorder_in_context else result)
         better.warnings.insert(0, (
@@ -1129,6 +1296,7 @@ def _design_flank_once(patch_sequence: str,
                        c_context: str = "",
                        selected_patch: Optional[str] = None,
                        binder_interface: str = "",
+                       epitope: str = "",
                        shells: Optional[Sequence] = None,
                        preset: Optional[str] = None,
                        config: Optional[DesignConfig] = None,
@@ -1290,7 +1458,8 @@ def _design_flank_once(patch_sequence: str,
                          else float(cfg.min_target_preference))
     if binder_interface and preference_target is not None:
         headroom = target_discriminability(patch_sequence, binder_interface,
-                                           model=cfg.epsilon_model)
+                                           model=cfg.epsilon_model,
+                                           target_shells=shells)
         if headroom <= _MIN_USEFUL_HEADROOM:
             preference_target = None
             infeasible_note = (
@@ -1319,6 +1488,7 @@ def _design_flank_once(patch_sequence: str,
             binder_competition_class(),
             binder_interface=binder_interface,
             target_patch=patch_sequence,
+            target_shells=shells,
             model=model,
             target_value=preference_target * length,
             weight=cfg.binder_weight,
@@ -1379,6 +1549,7 @@ def _design_flank_once(patch_sequence: str,
     scores = score_flank(sequence, patch_sequence,
                          n_context=n_context, c_context=c_context,
                          binder_interface=binder_interface,
+                         epitope=epitope,
                          shells=shells,
                          model=cfg.epsilon_model,
                          disorder_cutoff=cfg.disorder_cutoff,
@@ -1427,9 +1598,22 @@ def _design_flank_once(patch_sequence: str,
             f"the flank is more attracted to random sequence than to the "
             f"intended patch ({delta:+.3f} per residue); the design is not "
             f"on-target.")
+    epi_eps = scores.get("epsilon_vs_epitope", float("nan"))
+    if epi_eps == epi_eps and epi_eps < scores["epsilon_per_residue"]:
+        warnings.append(
+            f"the flank is more attracted to the target's own epitope "
+            f"({epi_eps:+.3f} per residue) than to the intended adjacent "
+            f"surface ({scores['epsilon_per_residue']:+.3f}), so it may "
+            f"compete with the binder for its own site. The epitope and the "
+            f"surface beside it are the same protein face, so this is often "
+            f"unavoidable -- judge it against how much affinity the flank adds.")
+
     binder_eps = scores.get("epsilon_vs_binder_interface", float("nan"))
+    target_eps = scores.get("epsilon_weighted", float("nan"))
+    if target_eps != target_eps:
+        target_eps = scores["epsilon_per_residue"]
     if binder_eps == binder_eps:
-        preference = binder_eps - scores["epsilon_per_residue"]
+        preference = binder_eps - target_eps
         # Verify the margin was actually achieved. The feasibility probe is an
         # upper bound over homopolymers, so it can promise more than a
         # composition-constrained design can deliver; only the finished flank
@@ -1446,7 +1630,7 @@ def _design_flank_once(patch_sequence: str,
             warnings.append(
                 f"the flank prefers the binder's own target-binding surface "
                 f"({binder_eps:+.3f} per residue) to the target "
-                f"({scores['epsilon_per_residue']:+.3f}), so it will compete "
+                f"({target_eps:+.3f}), so it will compete "
                 f"with the target and is likely to reduce net affinity. The "
                 f"two surfaces may be too chemically similar to tell apart.")
         elif preference < 0.02 and cfg.min_target_preference is None:
@@ -1490,6 +1674,8 @@ def _design_flank_once(patch_sequence: str,
         reference_epsilon_per_residue=scores["reference_epsilon_per_residue"],
         reference_epsilon_sd=scores.get("reference_epsilon_sd", float("nan")),
         binder_interface_sequence=binder_interface,
+        epitope_sequence=epitope,
+        epsilon_vs_epitope=scores.get("epsilon_vs_epitope", float("nan")),
         epsilon_vs_binder_interface=scores.get(
             "epsilon_vs_binder_interface", float("nan")),
         complexity=scores.get("complexity", float("nan")),

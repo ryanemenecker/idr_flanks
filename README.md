@@ -28,31 +28,43 @@ just `numpy`/`scipy`; GOOSE and FINCHES are imported only when you design.
 
 ## Quick start
 
-```python
-from idr_flanks import build_flanked_binder, describe_chains
+The workflow is two steps by design: **look at the interface, then commit to a
+region.** You must tell the tool which target residues the flank should
+complement — it will not choose for you, because automatic interface detection
+is not reliable on predicted structures (see below).
 
-# Which chain is which?
+```python
+from idr_flanks import build_flanked_binder, describe_chains, find_proximal_region
+from idr_flanks.io import read_structure
+
+# 1. Which chain is which?
 print(describe_chains("complex.pdb"))
 
+# 2. Look at the interface: which target residues are near the binder, and
+#    which patches look like prediction artifacts?
+s = read_structure("complex.pdb")
+print(find_proximal_region(s, binder_chain="B", target_chain="A",
+                           terminus="C", flank_length=30).summary())
+
+# 3. Commit to the region you trust, and design against it.
 result = build_flanked_binder(
     "complex.pdb",
-    binder_chain="B",      # the chain to extend
-    target_chain="A",      # the chain to bind better
-    c_flank_length=30,     # residues to add at the binder's C-terminus
+    binder_chain="B",              # the chain to extend
+    target_chain="A",              # the chain to bind better
+    c_flank_length=30,             # residues to add at the binder's C-terminus
+    target_residues=[250, 280],    # the target region to complement (required)
 )
 
 print(result.final_sequence)
-print(result.summary())    # everything below, explained
+print(result.summary())
 ```
 
-From the command line:
+From the command line, the same two steps:
 
 ```bash
 idr-flanks info complex.pdb
-```
-
-```bash
-idr-flanks design complex.pdb -b B -t A -c 30 --seed 1
+idr-flanks contacts complex.pdb -b B -t A -c 30      # explore the interface
+idr-flanks design complex.pdb -b B -t A -c 30 --target-residues 250-280 --seed 1
 ```
 
 `idr-flanks contacts` shows which target residues were selected without running
@@ -120,17 +132,36 @@ self-consistent patch indistinguishable from the genuine one. Only you know it
 is wrong, so say so:
 
 ```python
+# use only this region of the target
 result = build_flanked_binder("complex.pdb", binder_chain="B",
                              target_chain="A", c_flank_length=30,
+                             target_residues=[245, 275])
+
+# narrow a region, then rule part of it out
+result = build_flanked_binder("complex.pdb", binder_chain="B",
+                             target_chain="A", c_flank_length=30,
+                             target_residues="1-300",
                              exclude_target_residues=[1, 100])   # or "1-100"
 ```
 
-`include_target_residues` is the complement — consider only those residues.
-Both take author numbering, and accept `"1-100"`, `"1-100,250-300"`,
-`(1, 100)`, `[(1, 100), (250, 300)]`, `[5, 12, 88]`, or `range(1, 101)`. Note
-that a bare pair of integers means a *range*: `[1, 100]` is the first hundred
-residues, not residues 1 and 100. Whatever is parsed is echoed back in the
-region notes.
+`target_residues` gates the whole target-side analysis, not just the final
+answer: the filter runs on the contact set *before* the interface is located, so
+a contact outside your region cannot define an accepted sequence window.
+
+It is a **ceiling, not a forced set**. Reach, surface accessibility and the
+epitope guard still apply within your region, so you can get fewer residues than
+you asked for — on 1YCR, `target_residues=[96, 109]` yields 9 of the 14 because
+5 are epitope. How many survived, and which were dropped, is reported in the
+region notes. Add `exclude_epitope=False` if you want the region used verbatim.
+
+Both take author numbering and accept `"245-275"`, `"1-100,250-300"`,
+`(245, 275)`, `[(1, 100), (250, 300)]`, `[5, 12, 88]`, or `range(1, 101)`. Note
+that a bare pair of integers means a *range*: `[245, 275]` is residues 245
+through 275, not residues 245 and 275. They can be combined — `target_residues`
+narrows first, then `exclude_target_residues` removes from within it. Whatever
+is parsed is echoed back in the region notes.
+
+On the command line: `--target-residues 245-275` and `--exclude-target 1-100`.
 
 This applies **before** the interface is located, not just to the final
 selection — otherwise the mispredicted patch would still define an accepted
@@ -143,6 +174,69 @@ patch was 67% wrong region (32 K against 16 E) and the resulting flank came out
 acidic and **repelled** from the true site (+0.832 per residue). Excluding
 `[1, 100]` flipped it to basic and strongly attracted (−0.757). A sign error,
 silent apart from a "target presents 2 distinct interface patches" note.
+
+**Not the binder's own epitope.** The target residues the binder is directly
+contacting are excluded from the patch by default (`exclude_epitope`), because a
+flank complementary to them competes with the binder for its own site. The
+accessibility filter alone does not achieve this: it removes residues *fully*
+buried by the binder, but epitope-rim residues stay partially exposed and made
+up 26–35% of the patch on 1YCR before the guard existed.
+
+Be aware of what this does **not** buy you. Excluding the epitope from the patch
+does not stop the flank binding it, because the epitope and the surface beside
+it are the same protein face with nearly the same chemistry — on 1YCR the
+attainable preference for the adjacent surface over the epitope is only +0.04
+per residue, and the designed flank remains about twice as attracted to the
+epitope (−0.158) as to its intended patch (−0.090). An explicit repulsion
+constraint was tested and rejected: it moved the preference by 0.014, never
+enough to change the sign, at a 14% cost in on-target attraction. So the epitope
+attraction is **measured and warned about** rather than constrained. Judge a
+design on how much affinity it adds, not on the assumption that it leaves the
+epitope alone.
+
+**You choose the target region.** By default `build_flanked_binder` requires
+`target_residues` (or `include_target_residues`) — the tool will not pick the
+region for you. This is a deliberate refusal, not a missing feature: the whole
+of this section documents that automatic interface detection cannot reliably
+tell a real epitope from a prediction artifact, so quietly designing against an
+auto-detected region would silently aim the flank at the wrong surface on
+exactly the predicted structures this tool is for. Explore the interface first
+(`find_proximal_region` / `idr-flanks contacts`), then commit. Pass
+`auto_detect_region=True` only for a well-behaved experimental structure whose
+interface you trust.
+
+**Ranked interface patches, with artifact flagging.** When the target's contact
+surface splits into several sequence-separated patches, the region report ranks
+them by buried area and flags ones that look like prediction artifacts:
+
+```
+interface patches (ranked by buried area):
+  patch        %BSA contacts anchor_A pLDDT
+     280-298   100%       16      7.2    92  <-- dominant epitope
+       26-32    46%        6     26.0    76  likely prediction artifact
+       63-71    10%        4     20.5    82  likely prediction artifact
+      97-101     6%        3     26.3    86  likely prediction artifact
+...pass target_residues=[255, 323] ... or exclude_target_residues="26-32,63-71,97-101".
+```
+
+A patch is flagged when it is both minor (< 50% of the dominant epitope's buried
+area) *and* far from the flank's attachment point. This is **only a report**, it
+changes nothing — because no signal reliably tells an artifact from a genuine
+discontinuous epitope. That was verified adversarially: on a real predicted
+structure the spurious region is packed into van der Waals contact (2.6 Å) with
+the true epitope, *tighter* than a genuine antibody conformational epitope's own
+lobes are to each other (2.9 Å) — so spatial clustering, buried-area cutoffs and
+pLDDT thresholds all either miss the artifact or shred a real bipartite epitope.
+1YCR's genuine two-lobe MDM2 cleft is correctly *not* flagged (its second lobe is
+68% of the dominant area and sits at the anchor).
+
+The pLDDT column appears only for predicted structures (detected from an
+`_ma_qa_metric` / AlphaFold header, never guessed from B-factor magnitude).
+
+If you accept the trade-off, `dominant_epitope_only=True`
+(`--dominant-epitope-only`) restricts the design to the top patch, reproducing
+the manual `target_residues` fix automatically — but it can drop a genuine
+secondary epitope lobe, so it is off by default.
 
 **Sequence locality.** These are usually *predicted* structures, and predictors
 routinely place a sequence-distant part of the target next to the binder. The
@@ -337,7 +431,7 @@ inserts an `N`-residue GS linker between each flank and the binder:
 ```python
 result = build_flanked_binder("complex.pdb", binder_chain="B",
                              target_chain="A", c_flank_length=25,
-                             linker_length=6)
+                             target_residues=[250, 280], linker_length=6)
 # ETFSDLWKLLPEN(GSGSGS)[DPNPPEQHQDEWEYNENDNQPPEDP]
 ```
 
@@ -358,13 +452,51 @@ in-context disorder check. Supply `linker_sequence` for something other than GS.
 ```python
 result = build_flanked_binder("complex.pdb", binder_chain="B",
                              target_chain="A", c_flank_length=30,
-                             preset="soluble")
+                             target_residues=[250, 280], preset="soluble")
 ```
 
 Any individual knob can be overridden directly
 (`max_aromatic_fraction=0.05`, `composition_envelope=2.0`, `max_residues=15`,
 `radius=18.0`, …); arguments are routed to the interface or design stage
 automatically.
+
+## Re-scoring existing flanks
+
+To go back and compute the epsilon-vs-patch / epitope / binder-interface numbers
+for flanks you (or another method) generated earlier, without rerunning the
+design:
+
+```python
+from idr_flanks import score_flanks
+
+# point at the same structure and region you designed against
+scores = score_flanks(
+    ["EPQDNGPYDNNNEGPDQDEPWPQEPFEPQE", "GSGSGSGSGSGSGSGSGSGSGSGSGSGSGS"],
+    "complex.pdb", binder_chain="A", target_chain="B", terminus="C",
+    flank_length=30, target_residues=[250, 280])
+
+for s in scores:
+    print(s.summary())
+    print(s.epsilon_vs_patch, s.epsilon_vs_epitope, s.epsilon_vs_binder_interface)
+```
+
+Pass a single string (returns one result), a list (returns a list), or a
+`{name: sequence}` dict (returns a dict). To reproduce a design's reported
+numbers exactly, pass the **same** `target_residues`, `terminus` and
+`flank_length` (add any linker length) — the patch, epitope and binder interface
+all depend on them.
+
+If you kept the reference sequences instead of the structure, score directly
+with no structure at all:
+
+```python
+from idr_flanks import flank_epsilons
+
+flank_epsilons("EPQDNGPYD...", patch="KNCFRMT", epitope="...",
+               binder_interface="...")
+```
+
+## Reading the output
 
 ## Reading the output
 

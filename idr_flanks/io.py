@@ -457,7 +457,8 @@ class Structure:
     """Parsed structure: an ordered mapping of chain id to :class:`Chain`."""
 
     __slots__ = ("chains", "path", "format", "model", "skipped_residues",
-                 "warnings", "_hetero_xyz", "_hetero_elements")
+                 "warnings", "plddt_from_bfactor",
+                 "_hetero_xyz", "_hetero_elements")
 
     def __init__(self, path: str = "", fmt: str = "", model: Optional[int] = None):
         self.chains: "Dict[str, Chain]" = {}
@@ -468,6 +469,12 @@ class Structure:
         self.skipped_residues: Dict[str, int] = {}
         # non-fatal problems worth surfacing to the caller
         self.warnings: List[str] = []
+        # True when the B-factor column holds per-residue pLDDT rather than a
+        # crystallographic B-factor -- i.e. a predicted structure. Set only on
+        # an explicit declaration (mmCIF _ma_qa_metric or an AlphaFold REMARK),
+        # never guessed from magnitude, since crystal B-factors also fall in
+        # [0, 100].
+        self.plddt_from_bfactor: bool = False
         # Heavy atoms of residues that are not amino acids (nucleic acids,
         # glycans, cofactors). They are not part of any chain, but they do
         # occlude solvent, so their coordinates are kept.
@@ -717,10 +724,14 @@ def read_pdb(path: str, model: Optional[int] = None,
     found_wanted = False
     n_atom_records = 0
     seqres: Dict[str, List[str]] = {}
+    seen_plddt_header = False
 
     with _open_text(path) as fh:
         for line in fh:
             rec = line[:6]
+            if rec.startswith("REMARK") and "PLDDT" in line.upper():
+                seen_plddt_header = True
+                continue
             if rec == "SEQRES":
                 # SEQRES gives the chain as deposited, including residues that
                 # were never resolved. Columns: 12 chain id, 20-70 residue
@@ -827,6 +838,7 @@ def read_pdb(path: str, model: Optional[int] = None,
 
     struct = builder.finish()
     struct.model = wanted
+    struct.plddt_from_bfactor = seen_plddt_header
     for cid, names in seqres.items():
         chain = struct.chains.get(cid)
         if chain is not None:
@@ -1087,6 +1099,37 @@ def _cif_entity_poly(path: str) -> Dict[str, str]:
     return out
 
 
+def _cif_declares_plddt(path: str) -> bool:
+    """True if the mmCIF declares pLDDT as a model-quality metric.
+
+    Looks for an ``_ma_qa_metric`` row whose type/name is pLDDT. That is how
+    AlphaFold-DB and AF3 mmCIF files mark the B-factor column as confidence.
+    """
+    # The tag (_ma_qa_metric.name) and the value (pLDDT) sit on separate lines
+    # in the loop, so require both to appear anywhere in the header region
+    # rather than on one line. Stop at the atom records.
+    saw_qa_metric = False
+    saw_plddt = False
+    try:
+        with _open_text(path) as fh:
+            for _ in range(50000):
+                line = fh.readline()
+                if not line:
+                    break
+                low = line.lower()
+                if low.startswith(("atom ", "hetatm")):
+                    break
+                if "_ma_qa_metric" in low:
+                    saw_qa_metric = True
+                if "plddt" in low:
+                    saw_plddt = True
+                if saw_qa_metric and saw_plddt:
+                    return True
+    except OSError:
+        return False
+    return saw_qa_metric and saw_plddt
+
+
 def read_cif(path: str, model: Optional[int] = None,
              keep_altloc: str = "occupancy",
              prefer_auth: bool = True) -> Structure:
@@ -1260,6 +1303,7 @@ def read_cif(path: str, model: Optional[int] = None,
         )
     builder.struct.model = wanted_model
     struct = builder.finish()
+    struct.plddt_from_bfactor = _cif_declares_plddt(path)
     try:
         for cid, seq in _cif_entity_poly(path).items():
             chain = struct.chains.get(cid)
